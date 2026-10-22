@@ -68,9 +68,21 @@ DOWNLOAD_EXTENSIONS = {
     ".tar.zst", ".tar.zst.sig", ".iso.torrent",
 }
 
-# Empty allowlists must use set(); {} is an empty dict, not an empty set.
+# Empty allowlists must use set(); {} otherwise.
 ALLOWED_DOWNLOAD_TYPES: set[str] = set()
-ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".tar.zst"}
+ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".tar.zst", ".appimage", ".crx"}
+
+# Consumed by the page even when Google labels it attachment.
+INLINE_TYPES: set[str] = {
+    "application/json",
+    "application/javascript",
+    "application/x-javascript",
+    "text/javascript",
+    "text/html",
+    "application/xml",
+    "text/xml",
+    "application/x-protobuf",
+}
 
 
 def allowlist() -> set[str]:
@@ -195,7 +207,7 @@ def download_reason(flow: http.HTTPFlow) -> str | None:
     if allowed_extension(names):
         return None
 
-    if disposition.startswith("attachment"):
+    if disposition.startswith("attachment") and mime not in INLINE_TYPES:
         return "content-disposition"
     if mime in DOWNLOAD_TYPES:
         return f"type {mime}"
@@ -255,8 +267,6 @@ def request(flow: http.HTTPFlow) -> None:
     if is_allowed(flow):
         return
 
-    # Kill the download before a single byte transfers. If any types are
-    # exempt, the content type is needed to decide, so defer to responseheaders.
     if not ALLOWED_DOWNLOAD_TYPES:
         suffix = is_download_url(flow.request.pretty_url)
         if suffix:
