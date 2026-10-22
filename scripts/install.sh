@@ -33,6 +33,7 @@ DRY_RUN=0
 DO_ADMIN=0
 DO_ENFORCE=0
 DO_REMOVE_WHEEL=0
+ADMIN_ENABLED=0
 DO_TRUST_CA=0
 DO_UNINSTALL=0
 FORCE=0
@@ -142,6 +143,21 @@ require_root() {
         echo "run this with sudo: sudo $0 $*" >&2
         exit 1
     fi
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        DAILY_USER="${DAILY_USER:-$SUDO_USER}"
+    fi
+}
+
+# Sudo is not consulted with `sudo -l -U user` here: that fails for accounts
+# with a password until they authenticate, and fails entirely in containers.
+# Group membership is the property that actually decides access.
+user_has_sudo() {
+    local user="$1"
+    getent group wheel | cut -d: -f4 | tr ',' '\n' | grep -qx "$user"
+}
+
+user_password_set() {
+    [ "$(passwd -S "$1" 2>/dev/null | awk '{print $2}')" = "P" ]
 }
 
 update_ca_trust() {
@@ -154,10 +170,6 @@ update_ca_trust() {
     fi
 }
 
-nss_exec() {
-    local home="$1"; shift
-    run runuser -u "$DAILY_USER" -- env HOME="$home" "$@"
-}
 
 if [ ! -f /etc/arch-release ]; then
     echo "this installer targets Arch Linux (/etc/arch-release missing)" >&2
@@ -191,7 +203,8 @@ if [ "$DO_UNINSTALL" = 1 ]; then
     fi
     DAILY_HOME="$(getent passwd "$DAILY_USER" | cut -d: -f6 || true)"
     if [ -n "$DAILY_HOME" ] && [ -d "$DAILY_HOME/.pki/nssdb" ]; then
-        nss_exec "$DAILY_HOME" certutil -d "sql:$DAILY_HOME/.pki/nssdb" -D -n doorman 2>/dev/null || true
+        run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
+            certutil -d "sql:$DAILY_HOME/.pki/nssdb" -D -n doorman </dev/null 2>/dev/null || true
     fi
 
     run rm -rf "$CONF_DIR" "$PREFIX" "$LOG_DIR" "$STATE_DIR"
@@ -247,13 +260,21 @@ run chown "$SERVICE_USER:$SERVICE_GROUP" "$STATE_DIR" "$LOG_DIR"
 run install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_DIR/mitmproxy"
 
 if [ "$DO_ADMIN" = 1 ]; then
+    ADMIN_ENABLED=1
     if ! id "$ADMIN_USER" >/dev/null 2>&1; then
         run useradd -m -G wheel -s /bin/bash "$ADMIN_USER"
         run passwd "$ADMIN_USER"
     else
         run usermod -aG wheel "$ADMIN_USER"
     fi
-    run sudo -l -U "$ADMIN_USER" || true
+    if [ "$DRY_RUN" = 0 ]; then
+        if user_has_sudo "$ADMIN_USER" && user_password_set "$ADMIN_USER"; then
+            echo "$ADMIN_USER is in wheel and has a password set" >&2
+        else
+            echo "warning: $ADMIN_USER is in wheel but has no password set;" >&2
+            echo "         set one with: sudo passwd $ADMIN_USER" >&2
+        fi
+    fi
 fi
 
 if [ "$DO_REMOVE_WHEEL" = 1 ]; then
@@ -266,14 +287,22 @@ if [ "$DO_REMOVE_WHEEL" = 1 ]; then
             echo "admin and daily user must be different" >&2
             exit 1
         fi
-        if ! sudo -l -U "$ADMIN_USER" >/dev/null 2>&1; then
-            echo "$ADMIN_USER does not have working sudo; refusing to remove wheel" >&2
+        if ! user_has_sudo "$ADMIN_USER"; then
+            echo "$ADMIN_USER is not in wheel; refusing to remove wheel from $DAILY_USER" >&2
             exit 1
         fi
+        if ! user_password_set "$ADMIN_USER"; then
+            echo "$ADMIN_USER has no password set; refusing to remove wheel" >&2
+            echo "set one with: sudo passwd $ADMIN_USER" >&2
+            exit 1
+        fi
+        echo "about to remove $DAILY_USER from wheel." >&2
+        echo "$ADMIN_USER is the only remaining admin. Verify it from another TTY:" >&2
+        echo "  login as $ADMIN_USER, run: sudo -v" >&2
     fi
     run gpasswd -d "$DAILY_USER" wheel || true
-    echo "remaining sudo rules for $DAILY_USER:" >&2
-    run sudo -l -U "$DAILY_USER" || true
+    echo "remaining groups for $DAILY_USER:" >&2
+    run id "$DAILY_USER" || true
 fi
 
 if [ -n "$HELIUM_SRC" ]; then
@@ -312,11 +341,19 @@ if [ "$DO_TRUST_CA" = 1 ]; then
     run install -D -m 644 "$CA_CERT" /etc/ca-certificates/trust-source/anchors/doorman.crt
     update_ca_trust
     DAILY_HOME="$(getent passwd "$DAILY_USER" | cut -d: -f6 || true)"
+    NSSDB="$DAILY_HOME/.pki/nssdb"
     if [ -n "$DAILY_HOME" ]; then
-        run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" mkdir -p "$DAILY_HOME/.pki/nssdb"
-        nss_exec "$DAILY_HOME" certutil -d "sql:$DAILY_HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
-        nss_exec "$DAILY_HOME" certutil -d "sql:$DAILY_HOME/.pki/nssdb" -D -n doorman 2>/dev/null || true
-        nss_exec "$DAILY_HOME" certutil -d "sql:$DAILY_HOME/.pki/nssdb" -A -t "C,," -n doorman -i "$CA_CERT"
+        # certutil must not prompt: stdin is /dev/null, and a new DB is
+        # created with an empty password. An existing DB is left alone.
+        run install -d -m 700 -o "$DAILY_USER" "$NSSDB"
+        if [ "$DRY_RUN" = 0 ] && [ ! -f "$NSSDB/cert9.db" ]; then
+            run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
+                certutil -d "sql:$NSSDB" -N --empty-password </dev/null
+        fi
+        run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
+            certutil -d "sql:$NSSDB" -D -n doorman </dev/null 2>/dev/null || true
+        run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
+            certutil -d "sql:$NSSDB" -A -t "C,," -n doorman -i "$CA_CERT" </dev/null
     fi
 fi
 
@@ -510,6 +547,11 @@ EOF
 
 if [ "$DO_TRUST_CA" = 0 ]; then
     echo "warning: CA was not trusted; browser HTTPS will fail until --trust-ca is used" >&2
+fi
+
+if [ "$ADMIN_ENABLED" = 1 ] && [ "$DRY_RUN" = 0 ]; then
+    echo "admin account '$ADMIN_USER' is in wheel; log in as it once to verify" >&2
+    echo "before removing wheel from $DAILY_USER." >&2
 fi
 
 cat >&2 <<EOF
