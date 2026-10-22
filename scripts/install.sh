@@ -35,6 +35,7 @@ DO_ENFORCE=0
 DO_REMOVE_WHEEL=0
 ADMIN_ENABLED=0
 DO_TRUST_CA=0
+NSS_MODE=auto
 DO_UNINSTALL=0
 FORCE=0
 TTL=""
@@ -54,6 +55,9 @@ options:
   --remove-wheel          remove the daily user from wheel (explicit!)
   --trust-ca              install the CA system-wide and in the daily NSS DB
   --no-trust-ca           do not install the CA (browser MITM will fail)
+  --nss auto|shared|own   which NSS database to trust the CA in (default: auto)
+                          auto picks shared (~/.pki/nssdb) when it is usable,
+                          otherwise own (~/.config/doorman/nssdb)
   --no-upgrade            with --vm, do not run pacman -Syu
   --force                 overwrite generated allowlists/config
   --dry-run               print commands without changing anything
@@ -78,6 +82,7 @@ while [ $# -gt 0 ]; do
         --remove-wheel) DO_REMOVE_WHEEL=1; shift ;;
         --trust-ca) DO_TRUST_CA=1; shift ;;
         --no-trust-ca) NO_TRUST=1; DO_TRUST_CA=0; shift ;;
+        --nss) NSS_MODE="$2"; shift 2 ;;
         --no-upgrade) NO_UPGRADE=1; UPGRADE=0; shift ;;
         --force) FORCE=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -87,6 +92,11 @@ while [ $# -gt 0 ]; do
         *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
     esac
 done
+
+case "$NSS_MODE" in
+auto|shared|own) ;;
+*) echo "invalid --nss mode: $NSS_MODE (use auto, shared, or own)" >&2; exit 2 ;;
+esac
 
 if [ "$VM" = 1 ]; then
     ASSUME_YES=1
@@ -160,6 +170,66 @@ user_password_set() {
     [ "$(passwd -S "$1" 2>/dev/null | awk '{print $2}')" = "P" ]
 }
 
+NSS_TRUSTED=""
+
+# Emit the CA as a PEM block. mitmproxy writes the cert 0644 but its directory
+# is 0700, so read it as the owning user.
+print_ca_pem() {
+    runuser -u "$SERVICE_USER" -- cat "$CA_CERT"
+}
+
+add_ca_to_nssdb() {
+    local db="$1" home="$2"
+    run install -d -m 700 -o "$DAILY_USER" "$db"
+    if [ ! -f "$db/cert9.db" ]; then
+        run runuser -u "$DAILY_USER" -- env HOME="$home" \
+            certutil -d "sql:$db" -N --empty-password </dev/null
+    fi
+    run runuser -u "$DAILY_USER" -- env HOME="$home" \
+        certutil -d "sql:$db" -D -n doorman </dev/null 2>/dev/null || true
+    # certutil reads PEM from stdin; -a is for DER base64 files, not stdin.
+    print_ca_pem | run runuser -u "$DAILY_USER" -- env HOME="$home" \
+        certutil -d "sql:$db" -A -t "C,," -n doorman
+}
+
+install_nss_shared() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "+ install CA into the shared NSS store of $DAILY_USER"
+        return 0
+    fi
+    DAILY_HOME="$(getent passwd "$DAILY_USER" | cut -d: -f6 || true)"
+    [ -n "$DAILY_HOME" ] || return 1
+    NSSDB="$DAILY_HOME/.pki/nssdb"
+    # Chromium only uses this legacy store when its own key4.db exists and
+    # its pkcs11.txt still names the default database. A store initialized
+    # any other way is a profile-owned store; leave it untouched.
+    if [ -d "$NSSDB" ] && [ ! -f "$NSSDB/key4.db" ]; then
+        echo "warning: $NSSDB has no key4.db; not using the shared store" >&2
+        return 1
+    fi
+    if [ -f "$NSSDB/pkcs11.txt" ] && \
+        ! grep -q "configdir='sql:$NSSDB'" "$NSSDB/pkcs11.txt"; then
+        echo "warning: $NSSDB is a profile-owned store; not using it" >&2
+        return 1
+    fi
+    add_ca_to_nssdb "$NSSDB" "$DAILY_HOME"
+    NSS_TRUSTED=shared
+}
+
+install_nss_own() {
+    # A dedicated database, so nothing here can interact with another app's
+    # NSS profile. Helium is started with NSS_DEFAULT_DB_TYPE=sql and
+    # NSS_LIB_PARAMS=configdir=<this>, which makes it use this store.
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "+ install CA into a doorman-owned NSS store for $DAILY_USER"
+        return 0
+    fi
+    DAILY_HOME="$(getent passwd "$DAILY_USER" | cut -d: -f6 || true)"
+    [ -n "$DAILY_HOME" ] || return 1
+    add_ca_to_nssdb "$DAILY_HOME/.config/doorman/nssdb" "$DAILY_HOME"
+    NSS_TRUSTED=own
+}
+
 update_ca_trust() {
     if command -v update-ca-trust >/dev/null 2>&1; then
         run update-ca-trust
@@ -169,7 +239,6 @@ update_ca_trust() {
         echo "warning: no update-ca-trust or trust; system CA store not refreshed" >&2
     fi
 }
-
 
 if [ ! -f /etc/arch-release ]; then
     echo "this installer targets Arch Linux (/etc/arch-release missing)" >&2
@@ -202,9 +271,14 @@ if [ "$DO_UNINSTALL" = 1 ]; then
         update_ca_trust
     fi
     DAILY_HOME="$(getent passwd "$DAILY_USER" | cut -d: -f6 || true)"
-    if [ -n "$DAILY_HOME" ] && [ -d "$DAILY_HOME/.pki/nssdb" ]; then
-        run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
-            certutil -d "sql:$DAILY_HOME/.pki/nssdb" -D -n doorman </dev/null 2>/dev/null || true
+    if [ -n "$DAILY_HOME" ]; then
+        for DB in "$DAILY_HOME/.pki/nssdb" "$DAILY_HOME/.config/doorman/nssdb"; do
+            if [ -d "$DB" ]; then
+                run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
+                    certutil -d "sql:$DB" -D -n doorman </dev/null 2>/dev/null || true
+            fi
+        done
+        run rm -rf "$DAILY_HOME/.config/doorman"
     fi
 
     run rm -rf "$CONF_DIR" "$PREFIX" "$LOG_DIR" "$STATE_DIR"
@@ -332,28 +406,29 @@ if [ ! -f "$CA_CERT" ]; then
             --listen-host 127.0.0.1 --listen-port 18080 >/dev/null 2>&1 || true
     fi
 fi
-if [ "$DRY_RUN" = 0 ] && [ ! -f "$CA_CERT" ]; then
-    echo "mitmproxy did not generate $CA_CERT" >&2
+if [ "$DRY_RUN" = 0 ] && [ ! -r "$CA_CERT" ]; then
+    echo "mitmproxy did not generate a readable $CA_CERT" >&2
     exit 1
 fi
 
 if [ "$DO_TRUST_CA" = 1 ]; then
     run install -D -m 644 "$CA_CERT" /etc/ca-certificates/trust-source/anchors/doorman.crt
     update_ca_trust
-    DAILY_HOME="$(getent passwd "$DAILY_USER" | cut -d: -f6 || true)"
-    NSSDB="$DAILY_HOME/.pki/nssdb"
-    if [ -n "$DAILY_HOME" ]; then
-        # certutil must not prompt: stdin is /dev/null, and a new DB is
-        # created with an empty password. An existing DB is left alone.
-        run install -d -m 700 -o "$DAILY_USER" "$NSSDB"
-        if [ "$DRY_RUN" = 0 ] && [ ! -f "$NSSDB/cert9.db" ]; then
-            run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
-                certutil -d "sql:$NSSDB" -N --empty-password </dev/null
-        fi
-        run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
-            certutil -d "sql:$NSSDB" -D -n doorman </dev/null 2>/dev/null || true
-        run runuser -u "$DAILY_USER" -- env HOME="$DAILY_HOME" \
-            certutil -d "sql:$NSSDB" -A -t "C,," -n doorman -i "$CA_CERT" </dev/null
+
+    case "$NSS_MODE" in
+        shared)
+            install_nss_shared || echo "warning: shared NSS store unusable; browser profile will not trust the CA" >&2
+            ;;
+        own)
+            install_nss_own || echo "warning: could not set up the doorman NSS store" >&2
+            ;;
+        auto)
+            install_nss_shared || install_nss_own || \
+                echo "warning: could not set up an NSS store" >&2
+            ;;
+    esac
+    if [ "$DRY_RUN" = 0 ] && [ "$NSS_TRUSTED" = own ]; then
+        echo "Helium will use its own NSS store; start it with doorman-browser." >&2
     fi
 fi
 
@@ -371,6 +446,7 @@ BROWSER_PORT=$BROWSER_PORT
 STRICT_PORT=$STRICT_PORT
 PROXY_PORTS=$PROXY_PORTS
 HELIUM_APPIMAGE=$HELIUM_DST
+NSS_MODE=$NSS_MODE
 CA_CERT=$CA_CERT
 EOF
 
@@ -440,6 +516,13 @@ write_file /usr/local/bin/doorman-browser 755 <<'EOF'
 set -eu
 APP="${DOORMAN_HELIUM_APPIMAGE:-/opt/doorman/Helium.AppImage}"
 PROFILE="${DOORMAN_HELIUM_PROFILE:-$HOME/.config/doorman-helium}"
+NSSDIR="${DOORMAN_NSSDB:-$HOME/.config/doorman/nssdb}"
+# NSS_DEFAULT_DB_TYPE must be set before Helium starts, otherwise NSS may
+# initialize an incompatible database under NSSDIR.
+if [ -d "$NSSDIR" ]; then
+    export NSS_DEFAULT_DB_TYPE=sql
+    export NSS_LIB_PARAMS="configdir=$NSSDIR"
+fi
 exec "$APP" --user-data-dir="$PROFILE" --proxy-server="http://127.0.0.1:8080" "$@"
 EOF
 
