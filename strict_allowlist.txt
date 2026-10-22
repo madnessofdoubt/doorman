@@ -1,0 +1,9 @@
+# Hosts allowed through the strict proxy (everything except the browser).
+# One host per line. A host also allows its subdomains. '#' starts a comment.
+#
+# Start empty. Run with --dry-run, use the apps you care about, then add
+# exactly the hosts you saw that they need.
+api.deepseek.com
+example.com
+wikipedia.org
+wikimedia.org

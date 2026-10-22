@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Host allowlist proxy. Says yes or no by hostname, without decrypting TLS.
+
+    python strict_proxy.py --dry-run     # log decisions, allow everything
+    python strict_proxy.py               # log decisions, deny what is not listed
+
+Accepts CONNECT tunnels (what HTTP proxying uses), plain HTTP requests, and
+raw TLS streams (what a transparent redirect delivers). TLS is never decrypted:
+the SNI in the ClientHello is read, then bytes are piped untouched.
+"""
+
+import argparse
+import asyncio
+import re
+import sys
+from pathlib import Path
+
+from rules import load_host_list, matches
+
+BASE_DIR = Path(__file__).parent
+DEFAULT_ALLOWLIST = BASE_DIR / "strict_allowlist.txt"
+
+TLS_HANDSHAKE = 0x16
+TLS_CLIENT_HELLO = 0x01
+MAX_SNI_PEEK = 16 * 1024
+
+
+def parse_sni(data: bytes) -> str | None:
+    """SNI hostname from a TLS ClientHello, or None if absent/incomplete."""
+    if len(data) < 9 or data[0] != TLS_HANDSHAKE or data[5] != TLS_CLIENT_HELLO:
+        return None
+
+    end = 9 + ((data[6] << 16) | (data[7] << 8) | data[8])
+    i = 9 + 2 + 32  # handshake header, then client version + random
+    if i >= len(data) or i >= end:
+        return None
+
+    i += 1 + data[i]  # session id
+    if i + 2 > end:
+        return None
+    i += 2 + ((data[i] << 8) | data[i + 1])  # extensions
+    if i >= end:
+        return None
+    i += 1 + data[i]  # compression methods
+    if i + 2 > end:
+        return None
+    extensions_end = i + 2 + ((data[i] << 8) | data[i + 1])
+    i += 2
+
+    while i + 4 <= min(extensions_end, len(data)):
+        ext_type = (data[i] << 8) | data[i + 1]
+        ext_len = (data[i + 2] << 8) | data[i + 3]
+        i += 4
+        if ext_type == 0x0000:  # server_name
+            if i + 5 > len(data):
+                return None
+            name_len = (data[i + 3] << 8) | data[i + 4]
+            name = data[i + 5 : i + 5 + name_len]
+            return name.decode("ascii", "replace").lower().rstrip(".") or None
+        i += ext_len
+    return None
+
+
+def request_target(line: bytes) -> tuple[str | None, int]:
+    """Host and port from an absolute-form HTTP request line."""
+    m = re.match(rb"^[A-Z]+ (https?)://([^/\s:]+)(?::(\d+))?", line)
+    if not m:
+        return None, 0
+    port = int(m.group(3)) if m.group(3) else (443 if m.group(1) == b"https" else 80)
+    return m.group(2).decode("ascii", "replace").lower().rstrip("."), port
+
+
+def header_target(headers: bytes, default_port: int) -> tuple[str | None, int]:
+    """Host and port from a Host header."""
+    m = re.search(rb"^host:[ \t]*([^\r\n/]+)", headers, re.IGNORECASE | re.MULTILINE)
+    if not m:
+        return None, 0
+    value = m.group(1).decode("ascii", "replace").strip().lower().rstrip(".")
+    host, sep, port = value.rpartition(":")
+    if sep and port.isdigit():
+        return host, int(port)
+    return value, default_port
+
+
+class Guard:
+    def __init__(self, allowlist: Path, mode: str) -> None:
+        self.allowlist = allowlist
+        self.mode = mode  # "log" or "enforce"
+        self.allowed = load_host_list(allowlist)
+
+    def reload(self) -> None:
+        self.allowed = load_host_list(self.allowlist)
+
+    def decide(self, host: str | None) -> bool:
+        """Log one decision for host; return whether it may pass."""
+        ok = bool(host) and matches(host, self.allowed)
+        verdict = "ALLOW" if ok else "DENY "
+        if not ok and self.mode == "log":
+            verdict = "DRYRUN"
+        print(f"{verdict} {host or '-'}", flush=True)
+        return ok or self.mode == "log"
+
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await self.route(reader, writer)
+        except (ConnectionError, asyncio.IncompleteReadError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    async def route(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        first = await reader.read(1)
+        if not first:
+            return
+
+        if first == b"\x16":  # TLS ClientHello: read the record, then peek SNI
+            header = first + await reader.readexactly(4)
+            record_len = (header[3] << 8) | header[4]
+            data = header + await reader.readexactly(min(record_len, MAX_SNI_PEEK - 5))
+            sni = parse_sni(data)
+            if not self.decide(sni):
+                return
+            await self.tunnel(reader, writer, data, sni, 443, reply=False)
+            return
+
+        headers = first + await reader.readuntil(b"\r\n\r\n")
+        line = headers.split(b"\r\n", 1)[0]
+        if line.startswith(b"CONNECT "):
+            target = line.split()[1].decode("ascii", "replace")
+            host, _, port = target.rpartition(":")
+            if not self.decide(host or None):
+                return
+            await self.tunnel(reader, writer, b"", host, int(port or 443), reply=True)
+            return
+
+        host, port = request_target(line)
+        if not host:
+            host, port = header_target(headers, 80)
+        if not self.decide(host):
+            writer.write(
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            return
+        await self.forward(reader, writer, headers, host, port or 80)
+
+    async def tunnel(self, reader, writer, buffered: bytes, host: str, port: int, reply: bool) -> None:
+        """Connect to host:port and pipe bytes both ways untouched."""
+        try:
+            up_reader, up_writer = await asyncio.open_connection(host, port)
+        except OSError:
+            return
+        if reply:
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+        if buffered:
+            up_writer.write(buffered)
+            await up_writer.drain()
+        await self.pipe(reader, writer, up_reader, up_writer)
+
+    async def forward(self, reader, writer, head: bytes, host: str | None, port: int) -> None:
+        if not host:
+            return
+        # A proxy receives absolute-form requests; origins expect origin-form.
+        request_line, sep, rest = head.partition(b"\r\n")
+        m = re.match(rb"^([A-Z]+) https?://[^/\s]+([^\s]*) (HTTP/\d\.\d)$", request_line)
+        if m:
+            request_line = b" ".join([m.group(1), m.group(2) or b"/", m.group(3)])
+            head = request_line + sep + rest
+        try:
+            up_reader, up_writer = await asyncio.open_connection(host, port)
+        except OSError:
+            return
+        up_writer.write(head)
+        await up_writer.drain()
+        await self.pipe(reader, writer, up_reader, up_writer)
+
+    async def pipe(self, reader, writer, up_reader, up_writer) -> None:
+        async def copy(src, dst):
+            try:
+                while chunk := await src.read(65536):
+                    dst.write(chunk)
+                    await dst.drain()
+            finally:
+                dst.close()
+
+        await asyncio.gather(copy(reader, up_writer), copy(up_reader, writer))
+
+
+async def main(args) -> None:
+    guard = Guard(args.allowlist, args.mode)
+    server = await asyncio.start_server(guard.handle, args.listen_host, args.listen_port)
+    print(
+        f"strict proxy on {args.listen_host}:{args.listen_port} "
+        f"mode={args.mode} allowlisted={len(guard.allowed)} logged",
+        flush=True,
+    )
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
+    parser.add_argument("--listen-host", default="127.0.0.1")
+    parser.add_argument("--listen-port", type=int, default=8081)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="log decisions but allow everything",
+    )
+    args = parser.parse_args()
+    args.mode = "log" if args.dry_run else "enforce"
+    try:
+        asyncio.run(main(args))
+    except KeyboardInterrupt:
+        sys.exit(0)

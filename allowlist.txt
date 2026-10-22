@@ -1,3 +1,7 @@
 wikipedia.org
-http://192.168.0.250:8081/ # dashboard
-http://192.168.0.250:8096/ # jellyfin
+192.168.0.250:8081 # dashboard
+192.168.0.250:8096 # jellyfin
+freetubeapp.io
+chromewebstore.google.com
+cdn.jsdelivr.net # dashboard icons
+hcaptcha.com # captcha tiles

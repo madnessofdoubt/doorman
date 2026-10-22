@@ -70,7 +70,7 @@ DOWNLOAD_EXTENSIONS = {
 
 # Empty allowlists must use set(); {} otherwise.
 ALLOWED_DOWNLOAD_TYPES: set[str] = set()
-ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".tar.zst", ".appimage", ".crx"}
+ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".tar.zst", ".appimage", ".crx", ".iso"}
 
 # Consumed by the page even when Google labels it attachment.
 INLINE_TYPES: set[str] = {
