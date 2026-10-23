@@ -1,0 +1,15 @@
+# Hosts the strict proxy refuses, even when the default is "allow".
+#
+# A host also blocks its subdomains. '#' starts a comment.
+# Restart doorman-strict after editing.
+
+# The Steam store, including checkout.
+steampowered.com
+
+# Store videos and trailers.
+video.fastly.steamstatic.com
+
+# Deliberately NOT blocked: everything else Steam needs (auth, connection
+# managers, friends, community, avatars, game downloads). The in-game overlay
+# browser is not covered here; it can still load sites, and other policy layers
+# (the browser proxy, or a stricter proxy for that process) handle it.

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from rules import load_host_list, matches
+from rules import allowed, load_host_list, matches
 from strict_proxy import parse_sni
 
 
@@ -44,6 +44,36 @@ class RulesTest(unittest.TestCase):
 
     def test_missing_file_is_empty(self) -> None:
         self.assertEqual(load_host_list(Path("/nonexistent/doorman-allowlist")), set())
+
+    def test_wildcard_prefix_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "allow.txt"
+            path.write_text("*.example.com\n", encoding="utf-8")
+            self.assertEqual(load_host_list(path), {"example.com"})
+
+
+class PolicyTest(unittest.TestCase):
+    def test_strict_default_denies_everything(self) -> None:
+        self.assertFalse(allowed("anything.com", set(), set(), "deny"))
+        self.assertTrue(allowed("anything.com", set(), set(), "allow"))
+
+    def test_blocklist_wins_over_allowlist(self) -> None:
+        allow, block = {"example.com"}, {"example.com"}
+        self.assertFalse(allowed("example.com", allow, block, "deny"))
+
+    def test_default_allow_with_blocklist(self) -> None:
+        block = {"steampowered.com"}
+        self.assertFalse(allowed("store.steampowered.com", set(), block, "allow"))
+        self.assertFalse(allowed("api.steampowered.com", set(), block, "allow"))
+        self.assertTrue(allowed("steamcommunity.com", set(), block, "allow"))
+
+    def test_subdomain_block_does_not_hit_siblings(self) -> None:
+        block = {"store.steampowered.com"}
+        self.assertFalse(allowed("store.steampowered.com", set(), block, "allow"))
+        self.assertTrue(allowed("checkout.steampowered.com", set(), block, "allow"))
+
+    def test_empty_host_is_never_allowed(self) -> None:
+        self.assertFalse(allowed("", set(), set(), "allow"))
 
 
 class SniTest(unittest.TestCase):

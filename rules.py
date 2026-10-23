@@ -13,8 +13,11 @@ def load_host_list(path: Path) -> set[str]:
     hosts = set()
     for line in text.splitlines():
         entry = line.split("#", 1)[0].strip().lower().rstrip(".")
-        if entry:
-            hosts.add(entry)
+        if not entry:
+            continue
+        if entry.startswith("*."):
+            entry = entry[2:]
+        hosts.add(entry)
     return hosts
 
 
@@ -24,3 +27,22 @@ def matches(host: str, entries: set[str]) -> bool:
         return False
     host = host.lower().rstrip(".")
     return any(host == e or host.endswith("." + e) for e in entries)
+
+
+def host_key(host: str) -> str:
+    """Normalized hostname used in logs and for default-order decisions."""
+    return (host or "").lower().rstrip(".")
+
+
+def allowed(host: str, allow: set[str], block: set[str], default: str = "deny") -> bool:
+    """Blocklist wins, then the allowlist. With an empty allowlist, `default`
+    decides: "deny" blocks everything not blocked, "allow" blocks only the
+    blocklist."""
+    host = host_key(host)
+    if not host:
+        return False
+    if block and matches(host, block):
+        return False
+    if allow:
+        return matches(host, allow)
+    return default == "allow"

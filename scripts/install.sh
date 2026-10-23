@@ -22,6 +22,7 @@ HELIUM_SRC=""
 HELIUM_DST="$PREFIX/Helium.AppImage"
 BROWSER_PORT=8080
 STRICT_PORT=8081
+STRICT_DEFAULT=deny
 PROXY_PORTS=8080-8099
 
 VM=0
@@ -52,6 +53,8 @@ options:
   --helium PATH           Helium AppImage to install
   --enforce               apply the per-UID firewall and enable its unit
   --ttl DURATION          auto-revert enforcement after DURATION (e.g. 15m)
+  --default deny|allow    strict proxy default when the allowlist is empty
+                          (default: deny)
   --remove-wheel          remove the daily user from wheel (explicit!)
   --trust-ca              install the CA system-wide and in the daily NSS DB
   --no-trust-ca           do not install the CA (browser MITM will fail)
@@ -79,6 +82,7 @@ while [ $# -gt 0 ]; do
         --enforce) DO_ENFORCE=1; shift ;;
         --no-enforce) DO_ENFORCE=0; shift ;;
         --ttl) TTL="$2"; shift 2 ;;
+        --default) STRICT_DEFAULT="$2"; shift 2 ;;
         --remove-wheel) DO_REMOVE_WHEEL=1; shift ;;
         --trust-ca) DO_TRUST_CA=1; shift ;;
         --no-trust-ca) NO_TRUST=1; DO_TRUST_CA=0; shift ;;
@@ -96,6 +100,11 @@ done
 case "$NSS_MODE" in
 auto|shared|own) ;;
 *) echo "invalid --nss mode: $NSS_MODE (use auto, shared, or own)" >&2; exit 2 ;;
+esac
+
+case "$STRICT_DEFAULT" in
+deny|allow) ;;
+*) echo "invalid --default: $STRICT_DEFAULT (use deny or allow)" >&2; exit 2 ;;
 esac
 
 if [ "$VM" = 1 ]; then
@@ -129,7 +138,7 @@ write_file() {
 merge_allowlists() {
     local out="$1"; shift
     if [ "$DRY_RUN" = 1 ]; then
-        echo "+ merge allowlists into $out"
+        echo "+ merge lists into $out"
         return
     fi
     mkdir -p "$(dirname "$out")"
@@ -315,7 +324,7 @@ if [ ! -x "$PREFIX/.venv/bin/mitmdump" ]; then
 fi
 
 for f in addon.py strict_proxy.py rules.py allowlist.txt strict_allowlist.txt \
-         steam_allowlist.txt; do
+         steam_blocklist.txt; do
     if [ -f "$PROJECT_DIR/$f" ]; then
         run install -m 644 "$PROJECT_DIR/$f" "$PREFIX/$f"
     fi
@@ -434,8 +443,11 @@ fi
 
 if [ ! -f "$CONF_DIR/strict_allowlist.txt" ] || [ "$FORCE" = 1 ]; then
     merge_allowlists "$CONF_DIR/strict_allowlist.txt" \
-        "$PROJECT_DIR/strict_allowlist.txt" \
-        "$PROJECT_DIR/steam_allowlist.txt"
+        "$PROJECT_DIR/strict_allowlist.txt"
+fi
+if [ ! -f "$CONF_DIR/strict_blocklist.txt" ] || [ "$FORCE" = 1 ]; then
+    merge_allowlists "$CONF_DIR/strict_blocklist.txt" \
+        "$PROJECT_DIR/steam_blocklist.txt"
 fi
 
 write_file "$CONF_DIR/doorman.conf" 644 <<EOF
@@ -444,6 +456,7 @@ DAILY_UID=$(id -u "$DAILY_USER")
 SERVICE_USER=$SERVICE_USER
 BROWSER_PORT=$BROWSER_PORT
 STRICT_PORT=$STRICT_PORT
+STRICT_DEFAULT=$STRICT_DEFAULT
 PROXY_PORTS=$PROXY_PORTS
 HELIUM_APPIMAGE=$HELIUM_DST
 NSS_MODE=$NSS_MODE
@@ -483,7 +496,7 @@ Wants=network-online.target
 Type=simple
 User=doorman
 Group=doorman
-ExecStart=/opt/doorman/.venv/bin/python /opt/doorman/strict_proxy.py --listen-host 127.0.0.1 --listen-port 8081 --allowlist /etc/doorman/strict_allowlist.txt
+ExecStart=/opt/doorman/.venv/bin/python /opt/doorman/strict_proxy.py --listen-host 127.0.0.1 --listen-port 8081 --allowlist /etc/doorman/strict_allowlist.txt --blocklist /etc/doorman/strict_blocklist.txt --default $STRICT_DEFAULT
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true
@@ -618,13 +631,14 @@ cat >&2 <<EOF
 
   browser : /usr/local/bin/doorman-browser  (Helium, proxy :$BROWSER_PORT)
   steam   : /usr/local/bin/doorman-run steam
-  policy  : /etc/doorman/strict_allowlist.txt
+  policy  : /etc/doorman/strict_allowlist.txt (default $STRICT_DEFAULT)
+  block   : /etc/doorman/strict_blocklist.txt
   logs    : journalctl -u doorman-browser -u doorman-strict
   firewall: systemctl status doorman-firewall
 
-The strict allowlist is merged from strict_allowlist.txt and steam_allowlist.txt
-at install time. Edit /etc/doorman/strict_allowlist.txt and restart
-doorman-strict after changes.
+With --default deny (the default) the strict allowlist decides everything
+outside the blocklist. With --default allow, everything is allowed except the
+blocklist. Edit files in /etc/doorman and restart doorman-strict after changes.
 
 EOF
 

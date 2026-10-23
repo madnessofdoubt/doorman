@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-from rules import load_host_list, matches
+from rules import allowed, load_host_list
 
 BASE_DIR = Path(__file__).parent
 DEFAULT_ALLOWLIST = BASE_DIR / "strict_allowlist.txt"
@@ -83,17 +83,26 @@ def header_target(headers: bytes, default_port: int) -> tuple[str | None, int]:
 
 
 class Guard:
-    def __init__(self, allowlist: Path, mode: str) -> None:
+    def __init__(self, allowlist: Path, blocklist: Path | None, mode: str,
+                 default: str = "deny") -> None:
         self.allowlist = allowlist
+        self.blocklist = blocklist
         self.mode = mode  # "log" or "enforce"
+        self.default = default  # used only when the allowlist is empty
         self.allowed = load_host_list(allowlist)
+        self.blocked = load_host_list(blocklist) if blocklist else set()
 
     def reload(self) -> None:
         self.allowed = load_host_list(self.allowlist)
+        self.blocked = load_host_list(self.blocklist) if self.blocklist else set()
+
+    def permit(self, host: str) -> bool:
+        """Policy answer, before dry-run is applied."""
+        return allowed(host or "", self.allowed, self.blocked, self.default)
 
     def decide(self, host: str | None) -> bool:
         """Log one decision for host; return whether it may pass."""
-        ok = bool(host) and matches(host, self.allowed)
+        ok = self.permit(host or "")
         verdict = "ALLOW" if ok else "DENY "
         if not ok and self.mode == "log":
             verdict = "DRYRUN"
@@ -189,11 +198,12 @@ class Guard:
 
 
 async def main(args) -> None:
-    guard = Guard(args.allowlist, args.mode)
+    guard = Guard(args.allowlist, args.blocklist, args.mode, args.default)
     server = await asyncio.start_server(guard.handle, args.listen_host, args.listen_port)
     print(
         f"strict proxy on {args.listen_host}:{args.listen_port} "
-        f"mode={args.mode} allowlisted={len(guard.allowed)} logged",
+        f"mode={args.mode} default={args.default} "
+        f"allowlisted={len(guard.allowed)} blocked={len(guard.blocked)} logged",
         flush=True,
     )
     async with server:
@@ -203,8 +213,16 @@ async def main(args) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
+    parser.add_argument("--blocklist", type=Path, default=None)
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=8081)
+    parser.add_argument(
+        "--default",
+        choices=("deny", "allow"),
+        default="deny",
+        help="when the allowlist is empty: deny everything, or allow all "
+        "except the blocklist (default: deny)",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
