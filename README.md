@@ -20,6 +20,10 @@ sudo scripts/install.sh --vm --daily-user stan \
     --helium /path/Helium.AppImage --create-admin --enforce --ttl 15m
 ```
 
+This uses the default `--default deny` policy. `steam_allowlist.txt` is merged
+into `/etc/doorman/strict_allowlist.txt` so Steam can log in without switching
+the whole proxy to allow-all.
+
 `--vm` implies `--yes`, `--trust-ca`, and `pacman -Syu` (use `--no-upgrade`
 to skip the upgrade). `--enforce` is optional; `--ttl` schedules a root-owned
 auto-revert. `--remove-wheel` is **not** implied and refuses to run unless the
@@ -61,7 +65,9 @@ Development/manual Chromium:
 
 Uses `allowlist.txt` (fully exempt hosts) and the `ALLOWED_DOWNLOAD_TYPES` /
 `ALLOWED_DOWNLOAD_EXTENSIONS` sets in `addon.py`. In the installed layout the
-browser allowlist is `/opt/doorman/allowlist.txt`.
+browser allowlist is `/opt/doorman/allowlist.txt`. Entries are hostnames; a
+scheme or port in an entry is ignored, so the host is exempt on every port.
+Use `set()` (not `{}`) for an empty allow set; that blocks every download.
 
 ## Everything else
 
@@ -77,7 +83,8 @@ environment.
 Development/manual:
 
 ```bash
-scripts/doorman-run.sh --blocklist steam_blocklist.txt --default allow -- steam
+scripts/doorman-run.sh --allowlist steam_allowlist.txt \
+    --blocklist steam_blocklist.txt --default deny -- steam
 ```
 
 `doorman-run.sh` starts `strict_proxy.py`, exports `http_proxy`/`https_proxy`,
@@ -101,8 +108,8 @@ Discovery loop:
 ## Firewall
 
 The installer uses drop mode for the daily UID: direct TCP/UDP is dropped, DNS
-and loopback proxy ports are allowed. Apps must use a proxy. The lower-level
-test script supports both modes:
+and loopback (local IPC and the proxies) are allowed. Apps must use a proxy.
+The lower-level test script supports both modes:
 
 ```bash
 scripts/doorman-test-user.sh
@@ -128,8 +135,9 @@ sudo scripts/doorman-firewall.sh revert
 | `strict_proxy.py` | Host allowlist proxy (no MITM) |
 | `rules.py` | Shared host matching |
 | `allowlist.txt` | Browser-exempt hosts |
-| `strict_allowlist.txt` | Default strict allowlist (empty) |
-| `steam_blocklist.txt` | Steam store, for `--default allow` policy |
+| `strict_allowlist.txt` | Default strict allowlist; Steam hosts are merged in at install |
+| `steam_allowlist.txt` | Hosts Steam needs under `--default deny` |
+| `steam_blocklist.txt` | Hosts blocked even under `--default allow` (Steam trailers) |
 | `scripts/install.sh` | One-shot Arch installer |
 | `wrap-chromium.sh` | Launch Chromium through the browser proxy |
 | `scripts/doorman-run.sh` | Launch any app through the strict proxy |
@@ -143,12 +151,28 @@ sudo scripts/doorman-firewall.sh revert
 - Apps that ignore proxy settings bypass `strict_proxy.py` until the firewall
   is applied; with `--enforce`, they are dropped instead.
 - The installer has one strict proxy for all non-browser apps.
-- `--enforce` drops UDP except DNS. Steam multiplayer/voice, WebRTC, and LAN or
-  Tailscale destinations are blocked unless you add exceptions.
-- Steam game downloads and login need `--default allow` or a populated
-  allowlist; the shipped strict default is deny, which blocks the client.
-- The store cannot be blocked independently of `steampowered.com`; the blocklist
-  entry also blocks checkout and some client APIs.
+- The daily UID can reach both loopback proxies, so a non-browser app can use
+  the browser proxy (`:8080`) and bypass the strict allowlist for non-media
+  traffic, or forge a `Referer` from an allowlisted site. Closing this needs
+  per-process/cgroup rules or a separate browser UID.
+- `--enforce` drops outbound TCP/UDP except DNS and loopback. Steam
+  multiplayer/voice, WebRTC, and LAN or Tailscale destinations are blocked
+  unless you add exceptions.
+- Steam login and downloads work under `--default deny` because the installer
+  merges `steam_allowlist.txt` into the strict allowlist. Add any host Steam
+  logs as `DENY` while it runs.
+- The Steam store cannot be blocked independently of the login/API hosts on
+  `steampowered.com`. The shipped blocklist therefore only blocks store
+  trailers; the store tab remains reachable.
+- `--default allow` makes the strict proxy blocklist-only. It does not enforce
+  "apps are blocked unless allowed"; use `--default deny` with a populated
+  allowlist for that.
+- Media and download decisions use headers and URL extensions. A server that
+  mislabels a file, or a page that generates a `blob:`/`data:` download, can
+  bypass them; inspecting bytes or using browser download policy would be
+  needed.
+- Responses already in the browser cache are served without hitting the proxy;
+  clear the doorman browser profile after changing policy.
 - The strict proxy is IPv4-only for transparent redirects; IPv6 is dropped.
 - CA trust for Helium is installed system-wide and in `~/.pki/nssdb`, but a
   Chromium build with its own root store may still reject the MITM certificate.

@@ -35,14 +35,17 @@ def host_key(host: str) -> str:
 
 
 def allowed(host: str, allow: set[str], block: set[str], default: str = "deny") -> bool:
-    """Blocklist wins, then the allowlist. With an empty allowlist, `default`
-    decides: "deny" blocks everything not blocked, "allow" blocks only the
-    blocklist."""
+    """Blocklist wins, then the allowlist, then `default`.
+
+    `default` is the policy for hosts on neither list: "deny" is
+    allowlist-only, "allow" is blocklist-only. It applies even when the
+    allowlist is non-empty; otherwise a populated allowlist would silently
+    override default=allow."""
     host = host_key(host)
     if not host:
         return False
     if block and matches(host, block):
         return False
-    if allow:
-        return matches(host, allow)
+    if allow and matches(host, allow):
+        return True
     return default == "allow"

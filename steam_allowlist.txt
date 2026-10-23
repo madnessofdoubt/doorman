@@ -1,0 +1,38 @@
+# Hosts Steam needs for login, the library, community, and game downloads.
+#
+# Used with --default deny. A host also allows its subdomains. '#' starts a
+# comment. If Steam logs DENY for a host that is not listed here, add it:
+#
+#   journalctl -u doorman-strict -f
+#
+# The store shares steampowered.com with login and APIs, so it is allowed too.
+# The in-game overlay browser can reach these hosts but nothing else.
+#
+# The installer merges this file into /etc/doorman/strict_allowlist.txt.
+
+# Connectivity check and connection managers.
+steamconnecttest.com
+steamserver.net
+
+# Login, store, checkout, and client APIs.
+steampowered.com
+
+# Community, friends, workshop pages, and user images.
+steamcommunity.com
+steamusercontent.com
+steamcommunity-a.akamaihd.net
+steamuserimages-a.akamaihd.net
+
+# Store images, avatars, and trailers (trailers are blocked separately).
+steamstatic.com
+
+# Game downloads.
+steamcontent.com
+steamcdn-a.akamaihd.net
+steampipe.akamaized.net
+
+# Chat.
+steam-chat.com
+
+# Captcha, if Steam asks for one during login.
+hcaptcha.com

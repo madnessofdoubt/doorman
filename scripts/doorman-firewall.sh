@@ -6,15 +6,14 @@
 #   sudo scripts/doorman-firewall.sh status
 #   sudo scripts/doorman-firewall.sh revert
 #
-# The policy redirects TCP 80/443 from that UID to the strict proxy and drops
-# all other TCP/UDP, except DNS to the resolver and loopback to the proxy.
+# The policy allows DNS and loopback, then drops all other TCP/UDP from that
+# UID. Transparent redirect mode is available for testing.
 
 set -euo pipefail
 
 TABLE="${DOORMAN_TABLE:-doorman_test}"
 PORT=8081
 MODE=redirect
-PROXY_PORTS=8080-8099
 TARGET_UID=""
 TARGET_USER="${DOORMAN_TEST_USER:-doorman-test}"
 ACTION=""
@@ -28,7 +27,6 @@ options:
   --user NAME        user to restrict (default: doorman-test)
   --uid N            numeric uid instead of --user
   --proxy-port PORT  strict proxy port for redirect mode (default: 8081)
-  --proxy-ports RANGE loopback ports allowed in drop mode (default: 8080-8099)
   --mode MODE        redirect (transparent) or drop (explicit proxies)
   --dns ADDR         resolver to allow; repeatable
   --table NAME       nftables table name (default: doorman_test)
@@ -44,7 +42,6 @@ while [ $# -gt 0 ]; do
         --user) TARGET_USER="$2"; shift 2 ;;
         --uid) TARGET_UID="$2"; shift 2 ;;
         --proxy-port) PORT="$2"; shift 2 ;;
-        --proxy-ports) PROXY_PORTS="$2"; shift 2 ;;
         --mode) MODE="$2"; shift 2 ;;
         --dns) DNS+=("$2"); shift 2 ;;
         --table) TABLE="$2"; shift 2 ;;
@@ -65,10 +62,6 @@ if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; th
 fi
 if [ "$MODE" != "redirect" ] && [ "$MODE" != "drop" ]; then
     echo "invalid mode: $MODE (use redirect or drop)" >&2
-    exit 2
-fi
-if ! [[ "$PROXY_PORTS" =~ ^[0-9]+(-[0-9]+)?$ ]]; then
-    echo "invalid proxy port range: $PROXY_PORTS" >&2
     exit 2
 fi
 
@@ -120,11 +113,11 @@ EOF
     chain output_filter {
         type filter hook output priority 0; policy accept;
 
-        # The sandbox may reach the local proxies and its resolver.
+        # The sandbox may use loopback (local IPC and the proxies) and its resolver.
 EOF
     if [ "$MODE" = "drop" ]; then
-        echo "        meta skuid $TARGET_UID ip daddr 127.0.0.1 tcp dport $PROXY_PORTS accept"
-        echo "        meta skuid $TARGET_UID ip6 daddr ::1 tcp dport $PROXY_PORTS accept"
+        echo "        meta skuid $TARGET_UID ip daddr 127.0.0.0/8 accept"
+        echo "        meta skuid $TARGET_UID ip6 daddr ::1 accept"
     else
         echo "        meta skuid $TARGET_UID ip daddr 127.0.0.1 tcp dport $PORT accept"
         echo "        meta skuid $TARGET_UID ip6 daddr ::1 tcp dport $PORT accept"

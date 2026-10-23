@@ -23,7 +23,6 @@ HELIUM_DST="$PREFIX/Helium.AppImage"
 BROWSER_PORT=8080
 STRICT_PORT=8081
 STRICT_DEFAULT=deny
-PROXY_PORTS=8080-8099
 
 VM=0
 UPGRADE=0
@@ -53,8 +52,8 @@ options:
   --helium PATH           Helium AppImage to install
   --enforce               apply the per-UID firewall and enable its unit
   --ttl DURATION          auto-revert enforcement after DURATION (e.g. 15m)
-  --default deny|allow    strict proxy default when the allowlist is empty
-                          (default: deny)
+  --default deny|allow    policy for hosts on neither list (default: deny)
+                          deny = allowlist-only; allow = blocklist-only
   --remove-wheel          remove the daily user from wheel (explicit!)
   --trust-ca              install the CA system-wide and in the daily NSS DB
   --no-trust-ca           do not install the CA (browser MITM will fail)
@@ -324,7 +323,7 @@ if [ ! -x "$PREFIX/.venv/bin/mitmdump" ]; then
 fi
 
 for f in addon.py strict_proxy.py rules.py allowlist.txt strict_allowlist.txt \
-         steam_blocklist.txt; do
+         steam_allowlist.txt steam_blocklist.txt; do
     if [ -f "$PROJECT_DIR/$f" ]; then
         run install -m 644 "$PROJECT_DIR/$f" "$PREFIX/$f"
     fi
@@ -443,7 +442,8 @@ fi
 
 if [ ! -f "$CONF_DIR/strict_allowlist.txt" ] || [ "$FORCE" = 1 ]; then
     merge_allowlists "$CONF_DIR/strict_allowlist.txt" \
-        "$PROJECT_DIR/strict_allowlist.txt"
+        "$PROJECT_DIR/strict_allowlist.txt" \
+        "$PROJECT_DIR/steam_allowlist.txt"
 fi
 if [ ! -f "$CONF_DIR/strict_blocklist.txt" ] || [ "$FORCE" = 1 ]; then
     merge_allowlists "$CONF_DIR/strict_blocklist.txt" \
@@ -457,7 +457,6 @@ SERVICE_USER=$SERVICE_USER
 BROWSER_PORT=$BROWSER_PORT
 STRICT_PORT=$STRICT_PORT
 STRICT_DEFAULT=$STRICT_DEFAULT
-PROXY_PORTS=$PROXY_PORTS
 HELIUM_APPIMAGE=$HELIUM_DST
 NSS_MODE=$NSS_MODE
 CA_CERT=$CA_CERT
@@ -517,7 +516,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/opt/doorman/scripts/doorman-firewall.sh apply --mode drop --uid $(id -u "$DAILY_USER") --table doorman --proxy-ports $PROXY_PORTS
+ExecStart=/opt/doorman/scripts/doorman-firewall.sh apply --mode drop --uid $(id -u "$DAILY_USER") --table doorman
 ExecStop=/opt/doorman/scripts/doorman-firewall.sh revert --table doorman
 
 [Install]

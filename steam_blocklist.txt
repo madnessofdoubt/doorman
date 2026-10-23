@@ -2,14 +2,16 @@
 #
 # A host also blocks its subdomains. '#' starts a comment.
 # Restart doorman-strict after editing.
-
-# The Steam store, including checkout.
-steampowered.com
+#
+# Do NOT add steampowered.com or store.steampowered.com here. Steam uses the
+# same domain for login, checkout, and client APIs, so blocking it makes a
+# fresh client fail with "Steam needs to be online". Hostname-level filtering
+# cannot separate the store page from those. The store tab therefore stays
+# reachable; blocking it needs TLS interception with URL/path rules.
 
 # Store videos and trailers.
 video.fastly.steamstatic.com
 
-# Deliberately NOT blocked: everything else Steam needs (auth, connection
-# managers, friends, community, avatars, game downloads). The in-game overlay
-# browser is not covered here; it can still load sites, and other policy layers
-# (the browser proxy, or a stricter proxy for that process) handle it.
+# Everything else Steam needs (auth, connection managers, friends, community,
+# avatars, game downloads) is allowed. The in-game overlay browser is not
+# covered here; it shares Steam's network path.

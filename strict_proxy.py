@@ -88,7 +88,7 @@ class Guard:
         self.allowlist = allowlist
         self.blocklist = blocklist
         self.mode = mode  # "log" or "enforce"
-        self.default = default  # used only when the allowlist is empty
+        self.default = default  # policy for hosts on neither list
         self.allowed = load_host_list(allowlist)
         self.blocked = load_host_list(blocklist) if blocklist else set()
 
@@ -138,6 +138,11 @@ class Guard:
             target = line.split()[1].decode("ascii", "replace")
             host, _, port = target.rpartition(":")
             if not self.decide(host or None):
+                writer.write(
+                    b"HTTP/1.1 403 Forbidden\r\n"
+                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                await writer.drain()
                 return
             await self.tunnel(reader, writer, b"", host, int(port or 443), reply=True)
             return
@@ -158,7 +163,17 @@ class Guard:
         """Connect to host:port and pipe bytes both ways untouched."""
         try:
             up_reader, up_writer = await asyncio.open_connection(host, port)
-        except OSError:
+        except OSError as exc:
+            print(f"UPSTREAM {host}:{port} failed: {exc}", flush=True)
+            if reply:
+                body = f"cannot reach {host}:{port}: {exc}\n".encode()
+                writer.write(
+                    b"HTTP/1.1 502 Bad Gateway\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                )
+                await writer.drain()
             return
         if reply:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -179,7 +194,10 @@ class Guard:
             head = request_line + sep + rest
         try:
             up_reader, up_writer = await asyncio.open_connection(host, port)
-        except OSError:
+        except OSError as exc:
+            print(f"UPSTREAM {host}:{port} failed: {exc}", flush=True)
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
             return
         up_writer.write(head)
         await up_writer.drain()
@@ -220,8 +238,8 @@ if __name__ == "__main__":
         "--default",
         choices=("deny", "allow"),
         default="deny",
-        help="when the allowlist is empty: deny everything, or allow all "
-        "except the blocklist (default: deny)",
+        help="policy for hosts on neither list: deny (allowlist-only) "
+        "or allow (blocklist-only) (default: deny)",
     )
     parser.add_argument(
         "--dry-run",

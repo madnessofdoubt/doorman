@@ -1,6 +1,6 @@
 from email.message import Message
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from mitmproxy import ctx, http
 
@@ -68,7 +68,7 @@ DOWNLOAD_EXTENSIONS = {
     ".tar.zst", ".tar.zst.sig", ".iso.torrent",
 }
 
-# Empty allowlists must use set(); {} otherwise.
+# Empty sets must use set(); a non-empty set uses {"..."}.
 ALLOWED_DOWNLOAD_TYPES: set[str] = set()
 ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".tar.zst", ".appimage", ".crx", ".iso"}
 
@@ -85,6 +85,28 @@ INLINE_TYPES: set[str] = {
 }
 
 
+def normalize_host(value: str) -> str:
+    """Hostname from a list entry or request host, without scheme or port."""
+    value = value.strip().lower().rstrip(".")
+    if not value:
+        return ""
+    if "://" in value:
+        try:
+            value = urlparse(value).hostname or ""
+        except ValueError:
+            return ""
+    elif value.startswith("["):
+        end = value.find("]")
+        if end != -1:
+            value = value[1:end]
+    elif value.count(":") == 1:
+        host, _, port = value.rpartition(":")
+        if port.isdigit():
+            value = host
+    value = value.rstrip(".")
+    return value[2:] if value.startswith("*.") else value
+
+
 def allowlist() -> set[str]:
     try:
         text = ALLOWLIST_FILE.read_text(encoding="utf-8")
@@ -93,7 +115,7 @@ def allowlist() -> set[str]:
 
     result = set()
     for line in text.splitlines():
-        entry = line.split("#", 1)[0].strip().lower().rstrip(".")
+        entry = normalize_host(line.split("#", 1)[0])
         if entry:
             result.add(entry)
     return result
@@ -102,7 +124,7 @@ def allowlist() -> set[str]:
 def matches(host: str, entries: set[str]) -> bool:
     if not host or not entries:
         return False
-    host = host.lower().rstrip(".")
+    host = normalize_host(host)
     return any(host == e or host.endswith("." + e) for e in entries)
 
 
@@ -146,7 +168,8 @@ def disposition_filename(content_disposition: str) -> str:
 
 def names_of(flow: http.HTTPFlow, content_disposition: str) -> list[str]:
     """Lowercased basenames from the URL path and the offered filename."""
-    names = [Path(urlparse(flow.request.pretty_url).path).name.lower()]
+    path = unquote(urlparse(flow.request.pretty_url).path)
+    names = [Path(path).name.lower()]
     filename = disposition_filename(content_disposition)
     if filename:
         names.append(Path(filename).name.lower())
@@ -174,7 +197,7 @@ def blocked_extension(names: list[str], extensions: set[str]) -> str | None:
 
 def is_download_url(url: str) -> str | None:
     """Extension-based check - works before the server is contacted."""
-    name = Path(urlparse(url).path).name.lower()
+    name = Path(unquote(urlparse(url).path)).name.lower()
     if allowed_extension([name]):
         return None
     return blocked_extension([name], DOWNLOAD_EXTENSIONS)
@@ -278,7 +301,7 @@ def request(flow: http.HTTPFlow) -> None:
             )
             return
 
-    host = flow.request.pretty_host.lower()
+    host = normalize_host(flow.request.pretty_host)
 
     if host in BLOCKED_HOSTS:
         ctx.log.info(f"Blocked host: {host}")
@@ -293,6 +316,11 @@ def responseheaders(flow: http.HTTPFlow) -> None:
     if flow.response is None:
         return
 
+    # A 101 is a protocol upgrade (WebSocket). Streaming it as a normal
+    # response would break the upgraded connection.
+    if flow.response.status_code == 101:
+        return
+
     if is_allowed(flow):
         # Allowlisted sites are exempt; stream so large files are not buffered.
         flow.response.stream = True
@@ -301,6 +329,13 @@ def responseheaders(flow: http.HTTPFlow) -> None:
     if is_allowed_download(flow):
         # Allowed files would otherwise be buffered in memory in full.
         flow.response.stream = True
+        return
+
+    content_type = flow.response.headers.get("content-type", "")
+    if is_media(content_type):
+        # Block at headers, before the body is buffered in full.
+        ctx.log.info(f"Blocked media: {flow.request.pretty_url} ({content_type})")
+        block_body(flow, b"Media blocked\n")
         return
 
     reason = download_reason(flow)
@@ -315,7 +350,7 @@ def response(flow: http.HTTPFlow) -> None:
     if flow.response is None:
         return
 
-    if is_allowed(flow):
+    if is_allowed(flow) or is_allowed_download(flow):
         return
 
     content_type = flow.response.headers.get("content-type", "")
@@ -326,4 +361,5 @@ def response(flow: http.HTTPFlow) -> None:
     flow.response.status_code = 403
     flow.response.content = b"Media blocked\n"
     flow.response.headers["content-type"] = "text/plain; charset=utf-8"
+    flow.response.headers.pop("content-disposition", None)
     flow.response.headers.pop("content-encoding", None)

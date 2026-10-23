@@ -67,6 +67,12 @@ class PolicyTest(unittest.TestCase):
         self.assertFalse(allowed("api.steampowered.com", set(), block, "allow"))
         self.assertTrue(allowed("steamcommunity.com", set(), block, "allow"))
 
+    def test_default_applies_with_nonempty_allowlist(self) -> None:
+        allow = {"example.com"}
+        self.assertTrue(allowed("steamcommunity.com", allow, set(), "allow"))
+        self.assertFalse(allowed("steamcommunity.com", allow, set(), "deny"))
+        self.assertTrue(allowed("www.example.com", allow, set(), "deny"))
+
     def test_subdomain_block_does_not_hit_siblings(self) -> None:
         block = {"store.steampowered.com"}
         self.assertFalse(allowed("store.steampowered.com", set(), block, "allow"))
