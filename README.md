@@ -173,6 +173,9 @@ sudo scripts/doorman-firewall.sh revert
   needed.
 - Responses already in the browser cache are served without hitting the proxy;
   clear the doorman browser profile after changing policy.
+- Steam reports most update failures as "needs to be online", including a full
+  disk. If login fails, check `df -h /` and the proxy port before changing the
+  allowlist: `ss -ltn | grep 8081`.
 - The strict proxy is IPv4-only for transparent redirects; IPv6 is dropped.
 - CA trust for Helium is installed system-wide and in `~/.pki/nssdb`, but a
   Chromium build with its own root store may still reject the MITM certificate.

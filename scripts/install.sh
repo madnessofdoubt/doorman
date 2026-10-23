@@ -485,17 +485,20 @@ ReadWritePaths=/var/lib/doorman
 WantedBy=multi-user.target
 EOF
 
-write_file /etc/systemd/system/doorman-strict.service 644 <<'EOF'
+write_file /etc/systemd/system/doorman-strict.service 644 <<EOF
 [Unit]
 Description=doorman strict host allowlist proxy
 After=network-online.target
 Wants=network-online.target
+# A bad ExecStart must stop, not restart forever and bury the error.
+StartLimitIntervalSec=30
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=doorman
 Group=doorman
-ExecStart=/opt/doorman/.venv/bin/python /opt/doorman/strict_proxy.py --listen-host 127.0.0.1 --listen-port 8081 --allowlist /etc/doorman/strict_allowlist.txt --blocklist /etc/doorman/strict_blocklist.txt --default $STRICT_DEFAULT
+ExecStart=/opt/doorman/.venv/bin/python /opt/doorman/strict_proxy.py --listen-host 127.0.0.1 --listen-port $STRICT_PORT --allowlist /etc/doorman/strict_allowlist.txt --blocklist /etc/doorman/strict_blocklist.txt --default $STRICT_DEFAULT
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true
@@ -604,6 +607,29 @@ fi
 run systemctl daemon-reload
 run systemctl enable doorman-browser.service doorman-strict.service
 run systemctl restart doorman-browser.service doorman-strict.service
+
+# systemctl restart succeeds even when the process dies immediately, and
+# Restart=on-failure then hides it behind "activating (auto-restart)". A proxy
+# that is not listening makes every client look like a network outage.
+wait_listening() {
+    local port="$1" name="$2" tries=50 i=0
+    while [ "$i" -lt "$tries" ]; do
+        if ss -ltnH "sport = :$port" 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    echo "error: $name is not listening on :$port after restart" >&2
+    systemctl status "$name" --no-pager --lines=20 >&2 || true
+    echo "fix the unit above, then run: sudo systemctl restart $name" >&2
+    exit 1
+}
+
+if [ "$DRY_RUN" = 0 ] && command -v ss >/dev/null 2>&1; then
+    wait_listening "$BROWSER_PORT" doorman-browser.service
+    wait_listening "$STRICT_PORT" doorman-strict.service
+fi
 
 if [ "$DO_ENFORCE" = 1 ]; then
     run systemctl enable doorman-firewall.service
