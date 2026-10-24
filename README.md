@@ -112,7 +112,25 @@ doorman-run steam
 ```
 
 `doorman-run` uses the systemd strict proxy on `:8081` and exports the proxy
-environment.
+environment. The first run creates `/etc/doorman/apps/<app>.txt`, owned by
+your user, and tells you where it is. Add hosts there to extend the global
+allowlist for that app only:
+
+```conf
+# /etc/doorman/apps/steam.txt
+steamcloud-eu-ams.storage.googleapis.com
+```
+
+The global allowlist still applies. The file is used only after it contains at
+least one host, so the empty auto-created file does not change anything. Add
+the hosts, then restart the app; the proxy re-reads the file for new
+connections. The file name comes from the command name (`steam.txt`,
+`firefox.txt`); set `DOORMAN_APP_NAME` when a wrapper needs a different name.
+
+The proxy identifies the app from the username in the proxy URL. That is a
+label, not a security boundary: another program running as you can use the
+same name. Apps that do not send proxy credentials fall back to the global
+list, so their per-app entries are ignored.
 
 Development/manual:
 
@@ -124,8 +142,9 @@ scripts/doorman-run.sh --allowlist steam_allowlist.txt --default deny -- steam
 runs the command, and stops the proxy on exit.
 
 The strict proxy reads the TLS SNI or HTTP `Host` and allows or denies by
-hostname. TLS is never decrypted, so there is no CA to install and certificate
-pinning is not a problem.
+hostname. It also reads the optional proxy username to add a per-app
+allowlist. TLS is never decrypted, so there is no CA to install and
+certificate pinning is not a problem.
 
 Discovery loop:
 
@@ -159,7 +178,7 @@ existing firewall untouched.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest -v test_rules test_addon test_launcher test_migrate
+.venv/bin/python -m unittest -v test_rules test_addon test_launcher test_migrate test_apps test_doorman_run
 ```
 
 ## Files
@@ -178,19 +197,25 @@ existing firewall untouched.
 | `scripts/doorman-migrate-profile.sh` | Installed as `doorman-migrate-profile`; move an old profile into the default |
 | `wrap-chromium.sh` | Launch Chromium through the browser proxy |
 | `wrap-helium.sh` | Dev Helium launcher; normal profile, optional dev proxy |
-| `scripts/doorman-run.sh` | Launch any app through the strict proxy |
+| `scripts/doorman-run-app.sh` | Installed as `doorman-run`; per-app allowlist launcher |
+| `scripts/doorman-run.sh` | Development launcher for the strict proxy |
 | `scripts/doorman-firewall.sh` | Reversible per-UID nftables test policy |
 | `scripts/doorman-test-user.sh` | Create the throwaway test user |
 | `test_rules.py` | Matcher and SNI parser tests |
 | `test_addon.py` | Browser config parser tests |
 | `test_launcher.py` | Browser launcher tests |
 | `test_migrate.py` | Profile migration helper tests |
+| `test_apps.py` | Proxy auth and per-app allowlist tests |
+| `test_doorman_run.py` | Per-app launcher tests |
 | `policy/` | Chromium enterprise policy |
 
 ## Known gaps
 
 - Apps that ignore proxy settings bypass `strict_proxy.py` until the firewall
   is applied; with `--enforce`, they are dropped instead.
+- Per-app allowlists are additive and advisory. Any process running as the
+  daily user can present another app's name, and apps that ignore proxy
+  credentials fall back to the global list. Real isolation needs cgroups.
 - The installer has one strict proxy for all non-browser apps.
 - The daily UID can reach both loopback proxies, so a non-browser app can use
   the browser proxy (`:8080`) and bypass the strict allowlist for non-media

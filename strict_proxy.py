@@ -11,6 +11,8 @@ the SNI in the ClientHello is read, then bytes are piped untouched.
 
 import argparse
 import asyncio
+import base64
+import binascii
 import re
 import signal
 import sys
@@ -20,6 +22,8 @@ from rules import allowed, load_host_list
 
 BASE_DIR = Path(__file__).parent
 DEFAULT_ALLOWLIST = BASE_DIR / "strict_allowlist.txt"
+DEFAULT_APPS_DIR = Path("/etc/doorman/apps")
+APP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 TLS_HANDSHAKE = 0x16
 TLS_CLIENT_HELLO = 0x01
@@ -117,12 +121,56 @@ def parse_connect_target(target: str) -> tuple[str, int] | None:
     return host, port
 
 
+def parse_proxy_app(headers: bytes) -> tuple[bool, str | None]:
+    """(auth header present, app name) from Proxy-Authorization.
+
+    A missing header means "no per-app policy". A present but malformed
+    header returns (True, None), so the caller can answer 407 instead of
+    silently falling back to the global list.
+    """
+    if not re.search(rb"(?im)^proxy-authorization:", headers):
+        return False, None
+
+    match = re.search(
+        rb"(?im)^proxy-authorization:[ \t]*Basic[ \t]+([A-Za-z0-9+/=]+)[ \t]*\r?$",
+        headers,
+    )
+    if not match:
+        return True, None
+    try:
+        decoded = base64.b64decode(match.group(1), validate=True).decode(
+            "utf-8", "replace"
+        )
+    except (ValueError, binascii.Error):
+        return True, None
+    username, _, _password = decoded.partition(":")
+    app = username.strip().lower()
+    if not APP_NAME_RE.fullmatch(app):
+        return True, None
+    return True, app
+
+
+def strip_proxy_headers(head: bytes) -> bytes:
+    """Remove proxy credentials before forwarding a request to an origin."""
+    head = re.sub(rb"(?im)^proxy-authorization:[^\r\n]*\r?\n", b"", head)
+    head = re.sub(rb"(?im)^proxy-connection:[^\r\n]*\r?\n", b"", head)
+    return head
+
+
 class Guard:
-    def __init__(self, allowlist: Path, mode: str, default: str = "deny") -> None:
+    def __init__(
+        self,
+        allowlist: Path,
+        mode: str,
+        default: str = "deny",
+        apps_dir: Path | None = None,
+    ) -> None:
         self.allowlist = allowlist
         self.mode = mode  # "log" or "enforce"
         self.default = default  # policy for hosts not on the allowlist
         self.allowed = load_host_list(allowlist)
+        self.apps_dir = apps_dir if apps_dir is not None else DEFAULT_APPS_DIR
+        self._app_cache: dict[str, tuple[int, set[str]]] = {}
 
     def reload(self) -> None:
         hosts = load_host_list(self.allowlist)
@@ -130,18 +178,51 @@ class Guard:
             print(f"WARN allowlist missing: {self.allowlist}", flush=True)
         self.allowed = hosts
 
-    def permit(self, host: str) -> bool:
-        """Policy answer, before dry-run is applied."""
-        return allowed(host or "", self.allowed, self.default)
+    def app_allowed(self, app: str) -> set[str]:
+        """Extra hosts for one app, re-read when the app file changes."""
+        if not APP_NAME_RE.fullmatch(app):
+            return set()
+        path = self.apps_dir / f"{app}.txt"
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            self._app_cache.pop(app, None)
+            return set()
 
-    def decide(self, host: str | None) -> bool:
+        cached = self._app_cache.get(app)
+        if cached is None or cached[0] != mtime:
+            hosts = load_host_list(path)
+            self._app_cache[app] = (mtime, hosts)
+            print(f"APP {app} allowlisted={len(hosts)}", flush=True)
+            return hosts
+        return cached[1]
+
+    def permit(self, host: str, app: str | None = None) -> bool:
+        """Policy answer, before dry-run is applied."""
+        allow = self.allowed
+        if app:
+            extra = self.app_allowed(app)
+            if extra:
+                allow = allow | extra
+        return allowed(host or "", allow, self.default)
+
+    def decide(self, host: str | None, app: str | None = None) -> bool:
         """Log one decision for host; return whether it may pass."""
-        ok = self.permit(host or "")
+        ok = self.permit(host or "", app)
         verdict = "ALLOW" if ok else "DENY"
         if not ok and self.mode == "log":
             verdict = "DRYRUN"
-        print(f"{verdict} {host or '-'}", flush=True)
+        label = f"{app}:{host or '-'}" if app else (host or "-")
+        print(f"{verdict} {label}", flush=True)
         return ok or self.mode == "log"
+
+    async def auth_required(self, writer: asyncio.StreamWriter) -> None:
+        writer.write(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+            b'Proxy-Authenticate: Basic realm="doorman"\r\n'
+            b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -171,6 +252,11 @@ class Guard:
             return
 
         headers = first + await reader.readuntil(b"\r\n\r\n")
+        auth_present, app = parse_proxy_app(headers)
+        if auth_present and app is None:
+            print("BADAUTH", flush=True)
+            await self.auth_required(writer)
+            return
         line = headers.split(b"\r\n", 1)[0]
         if line.startswith(b"CONNECT "):
             parts = line.split()
@@ -188,7 +274,7 @@ class Guard:
                 await writer.drain()
                 return
             host, port = target
-            if not self.decide(host):
+            if not self.decide(host, app):
                 writer.write(
                     b"HTTP/1.1 403 Forbidden\r\n"
                     b"Content-Length: 0\r\nConnection: close\r\n\r\n"
@@ -201,7 +287,7 @@ class Guard:
         host, port = request_target(line)
         if not host:
             host, port = header_target(headers, 80)
-        if not self.decide(host):
+        if not self.decide(host, app):
             writer.write(
                 b"HTTP/1.1 403 Forbidden\r\n"
                 b"Content-Length: 0\r\nConnection: close\r\n\r\n"
@@ -237,6 +323,7 @@ class Guard:
     async def forward(self, reader, writer, head: bytes, host: str | None, port: int) -> None:
         if not host:
             return
+        head = strip_proxy_headers(head)
         # A proxy receives absolute-form requests; origins expect origin-form.
         request_line, sep, rest = head.partition(b"\r\n")
         m = re.match(rb"^([A-Z]+) https?://[^/\s]+([^\s]*) (HTTP/\d\.\d)$", request_line)
@@ -281,13 +368,13 @@ def install_sighup(guard: Guard) -> None:
 
 
 async def main(args) -> None:
-    guard = Guard(args.allowlist, args.mode, args.default)
+    guard = Guard(args.allowlist, args.mode, args.default, args.apps_dir)
     server = await asyncio.start_server(guard.handle, args.listen_host, args.listen_port)
     install_sighup(guard)
     print(
         f"strict proxy on {args.listen_host}:{args.listen_port} "
         f"mode={args.mode} default={args.default} "
-        f"allowlisted={len(guard.allowed)} logged",
+        f"allowlisted={len(guard.allowed)} apps={guard.apps_dir} logged",
         flush=True,
     )
     async with server:
@@ -299,6 +386,13 @@ if __name__ == "__main__":
     parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=8081)
+    parser.add_argument(
+        "--apps-dir",
+        type=Path,
+        default=DEFAULT_APPS_DIR,
+        help="directory of per-app allowlists, <app>.txt (default: "
+        "/etc/doorman/apps)",
+    )
     parser.add_argument(
         "--default",
         choices=("deny", "allow"),

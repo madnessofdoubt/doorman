@@ -1,7 +1,8 @@
 # doorman — agent handoff
 
-As of 2026-10-24. The browser-profile work is committed; see `git log` for
-the current commit. This document is for another agent picking up the project.
+As of 2026-10-24. The browser-profile and per-app allowlist work is
+committed; see `git log` for the current commit. This document is for another
+agent picking up the project.
 
 ## Purpose
 
@@ -50,11 +51,12 @@ remaining bypass until `--remove-wheel`.
 | `scripts/doorman-browser.sh` | Installed as `doorman-browser`; normal or configured Helium profile through `:8080` |
 | `scripts/doorman-migrate-profile.sh` | Installed as `doorman-migrate-profile`; explicit profile migration |
 | `scripts/doorman-firewall.sh` | `print`, `apply`, `status`, `revert`; `apply` validates and swaps atomically |
+| `scripts/doorman-run-app.sh` | Installed as `doorman-run`; creates and uses per-app allowlists |
 | `scripts/doorman-run.sh` | Dev launcher for the strict proxy |
 | `wrap-chromium.sh` | Dev browser launcher with its own test profile |
 | `wrap-helium.sh` | Dev browser launcher; normal Helium profile, optional dev proxy |
 | `policy/internet-blocker.json` | Chromium policy (incognito/guest disabled) |
-| `test_rules.py`, `test_addon.py`, `test_launcher.py`, `test_migrate.py` | Unit tests |
+| `test_rules.py`, `test_addon.py`, `test_launcher.py`, `test_migrate.py`, `test_apps.py`, `test_doorman_run.py` | Unit tests |
 | `v0.5brainstorm.md` | Per-app policy design note |
 
 ## Installed layout
@@ -62,7 +64,7 @@ remaining bypass until `--remove-wheel`.
 | Path | Contents |
 |---|---|
 | `/opt/doorman` | code, `.venv`, `Helium.AppImage` |
-| `/etc/doorman` | **live rules**: `allowlist.txt`, `downloads.conf`, `strict_allowlist.txt`, `doorman.conf` |
+| `/etc/doorman` | **live rules**: `allowlist.txt`, `downloads.conf`, `strict_allowlist.txt`, `doorman.conf`, `apps/` |
 | `/var/lib/doorman/mitmproxy` | mitmproxy CA certificate and key |
 | `/var/log/doorman` | directory only; services log to journald |
 | `/etc/systemd/system/doorman-{browser,strict,firewall}.service` | units |
@@ -80,6 +82,17 @@ Written by the installer: daily user and UID, ports, strict default, Helium
 path, NSS mode, CA path, and `BROWSER_PROFILE`. An empty `BROWSER_PROFILE`
 means Helium's normal profile. The value is preserved across reinstalls unless
 `--browser-profile` is passed.
+
+### `/etc/doorman/apps/<app>.txt`
+
+Per-app additions to the global strict allowlist. `doorman-run <app>` creates
+the file the first time the app runs; it is owned by the daily user and
+readable by the proxy. Entries are additive: the global list still applies to
+every app, and this file adds hosts only for the app whose proxy username
+matches the file name. The file is ignored until it has at least one
+non-comment line. Restart the app after adding the first entries so it sends
+the proxy username. Apps that do not send proxy credentials use the global
+list only.
 
 ### `/etc/doorman/allowlist.txt`
 
@@ -135,10 +148,10 @@ blocking the store, and hostname filtering cannot do that.
 **Steam Cloud is not covered.** Regional buckets such as
 `steamcloud-eu-ams.storage.googleapis.com`,
 `steamcloudfrankfurt.blob.core.windows.net`, and
-`steamcloud-frf.s3.dualstack.eu-central-1.amazonaws.com` are added manually to
-the live allowlist. Glob support (`steamcloud-*.storage.googleapis.com`) was
-discussed but **not implemented**; `rules.matches()` only does exact and suffix
-matching.
+`steamcloud-frf.s3.dualstack.eu-central-1.amazonaws.com` can now go in
+`/etc/doorman/apps/steam.txt` instead of the global list. Glob support
+(`steamcloud-*.storage.googleapis.com`) was discussed but **not implemented**;
+`rules.matches()` only does exact and suffix matching.
 
 ## Installer and modes
 
@@ -166,6 +179,8 @@ sudo scripts/install.sh --daily-user stan --no-upgrade \
 
 The installer now:
 
+- creates `/etc/doorman/apps` owned by the daily user;
+- installs `doorman-run` from `scripts/doorman-run-app.sh`;
 - rebuilds a venv that has `python` but no `pip`;
 - refuses to finish if `:8080` or `:8081` is not listening after restart;
 - stops a crash-looping strict proxy after 3 failures.
@@ -188,9 +203,12 @@ Verified on the host:
   proxy and is dropped by nftables. It is not selectively blocked by policy.
 - The strict proxy crash loop caused by `--default "$STRICT_DEFAULT"` was fixed
   by unquoting the unit heredoc.
-- 33 unit tests pass (including launcher, profile migration, SNI fuzz,
-  CONNECT parsing, and reload); `py_compile`, `bash -n`, and `git diff --check`
-  pass.
+- 46 unit tests pass (including per-app auth, launcher, profile migration,
+  SNI fuzz, CONNECT parsing, and reload); `py_compile`, `bash -n`, and
+  `git diff --check` pass.
+- `doorman-run <app>` creates `/etc/doorman/apps/<app>.txt`; the proxy adds
+  that file only for the matching proxy username. Live curl checks covered
+  allow-for-app, deny-for-other-app, global fallback, and 407 on bad auth.
 - The firewall validates a complete ruleset and swaps it in one nft
   transaction; a failed apply leaves the previous table in place.
 - Malformed CONNECT or TLS input is logged (`BAD CONNECT`, `ERROR`) instead of
@@ -200,8 +218,10 @@ Verified on the host:
 
 ## Current limitations
 
-- **One global app allowlist.** Every app that reaches `:8081` shares the same
-  hosts. No per-app policy yet.
+- **Per-app names are self-declared.** The proxy trusts the username in
+  `Proxy-Authorization`; another process running as the daily user can claim
+  the same name. The app file is additive to the global list. Apps that ignore
+  proxy credentials stay on the global list. Real isolation needs cgroups.
 - **Loopback bypass.** An app can point itself at `:8080` and use the browser
   proxy, bypassing the strict allowlist for non-media traffic, or forge a
   `Referer` from an allowlisted site. Closing this needs per-process/cgroup
@@ -237,29 +257,24 @@ Verified on the host:
   `doorman-browser` restart.
 - **Installer requires a Helium AppImage**, even for a strict-only host install.
   A missing AppImage aborts before the firewall step.
-- **Git push is blocked by the project's own firewall.** The remote is SSH;
-  port 22 is dropped. Use a temporary firewall stop or an SSH `ProxyCommand`
-  through `:8081`.
-- **No per-app attribution in logs.** The proxy logs host decisions, not which
-  process made the request.
+- **Pushing needs network.** The remote is HTTPS. With the firewall active,
+  the daily user's direct HTTPS is dropped; stop `doorman-firewall` briefly or
+  push through the strict proxy.
 
 ## Future ideas
 
 ### Per-app policies (v0.5)
 
-Design note: `v0.5brainstorm.md`. Summary:
+Partially implemented: `/etc/doorman/apps/<app>.txt`, selected by the proxy
+username and additive to the global list. Design note: `v0.5brainstorm.md`.
 
-- Profiles under `/etc/doorman/apps/<name>.allow` and `.pending`.
-- `doorman-run <app>` selects a proxy profile, e.g. via
-  `http://steam:<token>@127.0.0.1:8081`.
-- The proxy maps `Proxy-Authorization` to a profile.
-- nftables places the app in a cgroup and allows only its proxy port plus DNS.
-- `doorman-run --learn <app>` collects `DENY` hosts into `.pending`.
-- `doorman-allow <app> --pending` appends and reloads.
-- Overlay caveat: `steamwebhelper` inherits Steam's cgroup; fully blocking it
-  needs a separate cgroup or MITM/URL rules.
-- Recommended order: profiles + proxy auth, learn/allow commands, cgroup
-  nftables, separate UID/netns only if hard isolation is needed.
+Still future:
+
+- `.pending` files, `doorman-run --learn`, and `doorman-allow`;
+- nftables cgroups for real per-app isolation;
+- overlay caveat: `steamwebhelper` inherits Steam's cgroup; fully blocking it
+  needs a separate cgroup or MITM/URL rules;
+- separate UID/netns only if hard isolation is needed.
 
 ### Modes
 
@@ -287,7 +302,8 @@ check `nft list` rather than `systemctl status`.
 ## Testing and diagnostics
 
 ```bash
-.venv/bin/python -m unittest -v test_rules test_addon test_launcher test_migrate
+.venv/bin/python -m unittest -v test_rules test_addon test_launcher \
+    test_migrate test_apps test_doorman_run
 
 journalctl -u doorman-strict -f
 journalctl -u doorman-browser -f
@@ -301,9 +317,11 @@ systemctl status doorman-browser doorman-strict doorman-firewall --no-pager
 
 Strict proxy log lines:
 
-- `ALLOW host`
-- `DENY host`
-- `DRYRUN host`
+- `ALLOW host` / `ALLOW app:host`
+- `DENY host` / `DENY app:host`
+- `DRYRUN host` / `DRYRUN app:host`
+- `APP app allowlisted=N` when an app file is loaded or changes
+- `BADAUTH` for a malformed `Proxy-Authorization` header
 - `UPSTREAM host:port failed: ...`
 
 ## Important gotchas
@@ -324,16 +342,19 @@ Strict proxy log lines:
 - `--no-enforce` does not undo active nftables rules.
 - `--ttl` reverts nftables but leaves the unit enabled; check `nft list`.
 - The daily UID can reach both proxies; this is a known bypass.
-- `doorman-run` only exports proxy env and execs. It does not filter anything.
+- `doorman-run` creates the per-app file and exports proxy env; the proxy does
+  the filtering. Add hosts to `/etc/doorman/apps/<app>.txt`, then restart the
+  app after the first entry so it sends the proxy username.
 - The strict proxy logs to journald, not `/var/log/doorman`.
-- `git push` over SSH is dropped while enforcement is on. Workarounds:
-  temporarily stop `doorman-firewall`, or use an SSH `ProxyCommand` through
-  `:8081` after allowlisting `github.com`.
+- `git push` needs network. With enforcement on, direct HTTPS is dropped;
+  temporarily stop `doorman-firewall` or push through the strict proxy.
 
 ## Security model
 
 - Policy is enforced per UID, not per binary.
-- The strict proxy decides by hostname; it does not decrypt TLS.
+- The strict proxy decides by hostname; it does not decrypt TLS. Per-app
+  allowlists are selected by a self-declared proxy username and are additive
+  to the global list; they are policy organisation, not isolation.
 - Root is exempt; `--remove-wheel` is the normal lockdown step.
 - The browser proxy MITMs; the app proxy does not.
 - Proxy environment variables are routing, not enforcement. A process can clear
@@ -342,15 +363,17 @@ Strict proxy log lines:
 
 ## Git state
 
-The browser-profile work is committed; see `git log` for the current commit.
-The working tree should be clean.
+The per-app allowlist work is committed; see `git log` for the current
+commit. The working tree should be clean.
 
-- `doorman-browser` and `wrap-helium.sh` use Helium's normal profile, or the
-  `BROWSER_PROFILE` from `doorman.conf`, and refuse while Helium is running.
-- `--browser-profile` selects an existing profile and is preserved across
-  reinstalls; `doorman-migrate-profile` moves an older profile with a backup.
-- `test_launcher.py` and `test_migrate.py` cover the launch, config, guard, and
-  migration paths; README and this document updated.
+- `strict_proxy.py` reads an optional `Proxy-Authorization` username, loads
+  `apps/<app>.txt`, adds it to the global list for that app, strips proxy
+  headers before forwarding, and answers 407 on malformed credentials;
+- `scripts/doorman-run-app.sh` creates the per-app file and uses proxy
+  credentials only after the file has entries;
+- the installer creates `/etc/doorman/apps` and installs the new runner;
+- `test_apps.py` and `test_doorman_run.py` cover parsing, union, reload, file
+  creation, and fallback; README and this document updated.
 
 Verify with `git status` before assuming. Do not commit or rewrite the user's
 changes without being asked.

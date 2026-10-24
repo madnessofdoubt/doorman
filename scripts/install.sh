@@ -309,6 +309,7 @@ if [ -z "$DAILY_HOME" ]; then
     echo "cannot find the home directory for $DAILY_USER" >&2
     exit 1
 fi
+DAILY_GROUP="$(id -gn "$DAILY_USER")"
 
 # Keep an explicit profile across reinstalls unless it is changed now.
 if [ "$BROWSER_PROFILE_SET" = 0 ] && [ -f "$CONF_DIR/doorman.conf" ]; then
@@ -338,6 +339,7 @@ if ! pacman -Q fuse2 >/dev/null 2>&1; then
 fi
 
 run install -d -m 755 "$PREFIX" "$CONF_DIR" "$LOG_DIR" "$STATE_DIR"
+run install -d -m 755 -o "$DAILY_USER" -g "$DAILY_GROUP" "$CONF_DIR/apps"
 run install -d -m 755 "$PREFIX/scripts"
 
 if [ ! -x "$PREFIX/.venv/bin/python" ]; then
@@ -371,6 +373,7 @@ done
 run install -m 755 "$PROJECT_DIR/scripts/doorman-firewall.sh" "$PREFIX/scripts/doorman-firewall.sh"
 run install -m 755 "$PROJECT_DIR/scripts/doorman-browser.sh" /usr/local/bin/doorman-browser
 run install -m 755 "$PROJECT_DIR/scripts/doorman-migrate-profile.sh" /usr/local/bin/doorman-migrate-profile
+run install -m 755 "$PROJECT_DIR/scripts/doorman-run-app.sh" /usr/local/bin/doorman-run
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     run useradd --system --home "$STATE_DIR" --shell /usr/bin/nologin "$SERVICE_USER"
@@ -575,29 +578,7 @@ EOF
 
 # doorman-browser is installed from scripts/doorman-browser.sh above.
 
-write_file /usr/local/bin/doorman-run 755 <<'EOF'
-#!/bin/sh
-set -eu
-if [ $# -lt 1 ]; then
-    echo "usage: doorman-run <steam|command> [args...]" >&2
-    exit 2
-fi
-app="$1"
-shift
-case "$app" in
-    steam) cmd="${DOORMAN_STEAM_CMD:-steam}" ;;
-    *) cmd="$app" ;;
-esac
-export http_proxy="http://127.0.0.1:8081"
-export https_proxy="$http_proxy"
-export HTTP_PROXY="$http_proxy"
-export HTTPS_PROXY="$http_proxy"
-export all_proxy="$http_proxy"
-export ALL_PROXY="$http_proxy"
-export no_proxy="localhost,127.0.0.1,::1"
-export NO_PROXY="$no_proxy"
-exec "$cmd" "$@"
-EOF
+# doorman-run is installed from scripts/doorman-run-app.sh above.
 
 write_file /usr/share/applications/doorman-browser.desktop 644 <<'EOF'
 [Desktop Entry]
@@ -692,6 +673,7 @@ cat >&2 <<EOF
   profile : ${BROWSER_PROFILE:-Helium default profile}
   browser rules: /etc/doorman/allowlist.txt, /etc/doorman/downloads.conf
   steam   : /usr/local/bin/doorman-run steam
+  apps    : /etc/doorman/apps/<app>.txt
   policy  : /etc/doorman/strict_allowlist.txt (default $STRICT_DEFAULT)
   logs    : journalctl -u doorman-browser -u doorman-strict
   firewall: systemctl status doorman-firewall
