@@ -29,6 +29,10 @@ to skip the upgrade). `--enforce` is optional; `--ttl` schedules a root-owned
 auto-revert. `--remove-wheel` is **not** implied and refuses to run unless the
 admin account has working sudo.
 
+`--browser-profile PATH` makes `doorman-browser` use an existing Helium
+profile; without it, Helium's normal profile is used. The setting is kept in
+`/etc/doorman/doorman.conf` and survives reinstalls.
+
 After install:
 
 ```bash
@@ -64,7 +68,26 @@ Installed:
 doorman-browser
 ```
 
-That launches Helium with the dedicated profile and `--proxy-server=http://127.0.0.1:8080`.
+That launches Helium with your normal profile and
+`--proxy-server=http://127.0.0.1:8080`, so your existing cookies and logins
+stay. Close Helium completely before starting it: a second launch would
+otherwise join the running instance, which has no proxy, so the launcher
+refuses to start. The `helium` shortcut installed by `wrap-helium.sh` uses
+the same normal profile; it still starts a development proxy when `:8080` is
+not already listening.
+
+If your profile lives somewhere else, set `BROWSER_PROFILE=/path/to/profile`
+in `/etc/doorman/doorman.conf` (empty means Helium's normal profile), or
+reinstall with `--browser-profile /path/to/profile`. The old dedicated
+profile at `~/.config/doorman-helium` is no longer used. To move an older
+profile into the normal default, close Helium and run:
+
+```bash
+doorman-migrate-profile --from ~/.config/doorman-helium
+```
+
+It keeps a timestamped backup and refuses while Helium is running. A custom
+profile selected with `--browser-profile` does not need migration.
 
 Development/manual Chromium:
 
@@ -136,7 +159,7 @@ existing firewall untouched.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest -v test_rules test_addon
+.venv/bin/python -m unittest -v test_rules test_addon test_launcher test_migrate
 ```
 
 ## Files
@@ -151,12 +174,17 @@ existing firewall untouched.
 | `strict_allowlist.txt` | Default strict allowlist; Steam hosts are merged in at install |
 | `steam_allowlist.txt` | Hosts Steam needs under `--default deny` |
 | `scripts/install.sh` | One-shot Arch installer |
+| `scripts/doorman-browser.sh` | Installed as `doorman-browser`; launches Helium with the normal or configured profile |
+| `scripts/doorman-migrate-profile.sh` | Installed as `doorman-migrate-profile`; move an old profile into the default |
 | `wrap-chromium.sh` | Launch Chromium through the browser proxy |
+| `wrap-helium.sh` | Dev Helium launcher; normal profile, optional dev proxy |
 | `scripts/doorman-run.sh` | Launch any app through the strict proxy |
 | `scripts/doorman-firewall.sh` | Reversible per-UID nftables test policy |
 | `scripts/doorman-test-user.sh` | Create the throwaway test user |
 | `test_rules.py` | Matcher and SNI parser tests |
 | `test_addon.py` | Browser config parser tests |
+| `test_launcher.py` | Browser launcher tests |
+| `test_migrate.py` | Profile migration helper tests |
 | `policy/` | Chromium enterprise policy |
 
 ## Known gaps
@@ -184,11 +212,16 @@ existing firewall untouched.
   bypass them; inspecting bytes or using browser download policy would be
   needed.
 - Responses already in the browser cache are served without hitting the proxy;
-  clear the doorman browser profile after changing policy.
+  hard-reload or clear the site's cache. Clearing the whole profile would sign
+  you out of everything.
 - Steam reports most update failures as "needs to be online", including a full
   disk. If login fails, check `df -h /` and the proxy port before changing the
   allowlist: `ss -ltn | grep 8081`.
 - The strict proxy is IPv4-only for transparent redirects; IPv6 is dropped.
+- The installer cannot detect a profile selected by a third-party wrapper or
+  desktop file. Pass `--browser-profile` or set `BROWSER_PROFILE`.
+- Profile migration is explicit; the installer warns about the old doorman
+  and dev profiles but never moves them.
 - CA trust for Helium is installed system-wide and in `~/.pki/nssdb`, but a
   Chromium build with its own root store may still reject the MITM certificate.
 - Package managers run as root and are not covered by any of the above.

@@ -23,6 +23,8 @@ HELIUM_DST="$PREFIX/Helium.AppImage"
 BROWSER_PORT=8080
 STRICT_PORT=8081
 STRICT_DEFAULT=deny
+BROWSER_PROFILE=""
+BROWSER_PROFILE_SET=0
 
 VM=0
 UPGRADE=0
@@ -50,6 +52,7 @@ options:
   --admin NAME            create this admin user (default: admin)
   --create-admin          create the default admin user
   --helium PATH           Helium AppImage to install
+  --browser-profile PATH  Helium profile to use (default: Helium's normal profile)
   --enforce               apply the per-UID firewall and enable its unit
   --ttl DURATION          auto-revert enforcement after DURATION (e.g. 15m)
   --default deny|allow    policy for hosts not on the allowlist (default: deny)
@@ -78,6 +81,7 @@ while [ $# -gt 0 ]; do
         --admin) DO_ADMIN=1; ADMIN_USER="$2"; shift 2 ;;
         --create-admin) DO_ADMIN=1; shift ;;
         --helium) HELIUM_SRC="$2"; shift 2 ;;
+        --browser-profile) BROWSER_PROFILE="$2"; BROWSER_PROFILE_SET=1; shift 2 ;;
         --enforce) DO_ENFORCE=1; shift ;;
         --no-enforce) DO_ENFORCE=0; shift ;;
         --ttl) TTL="$2"; shift 2 ;;
@@ -270,7 +274,8 @@ if [ "$DO_UNINSTALL" = 1 ]; then
         /etc/systemd/system/doorman-strict.service \
         /etc/systemd/system/doorman-firewall.service
     run systemctl daemon-reload
-    run rm -f /usr/local/bin/doorman-browser /usr/local/bin/doorman-run
+    run rm -f /usr/local/bin/doorman-browser /usr/local/bin/doorman-run \
+        /usr/local/bin/doorman-migrate-profile
     run rm -f /usr/share/applications/doorman-browser.desktop \
         /usr/share/applications/doorman-steam.desktop
 
@@ -297,6 +302,27 @@ fi
 
 if [ "$VM" = 1 ] && [ "$UPGRADE" = 1 ]; then
     run pacman -Syu --noconfirm
+fi
+
+DAILY_HOME="$(getent passwd "$DAILY_USER" | cut -d: -f6 || true)"
+if [ -z "$DAILY_HOME" ]; then
+    echo "cannot find the home directory for $DAILY_USER" >&2
+    exit 1
+fi
+
+# Keep an explicit profile across reinstalls unless it is changed now.
+if [ "$BROWSER_PROFILE_SET" = 0 ] && [ -f "$CONF_DIR/doorman.conf" ]; then
+    BROWSER_PROFILE="$(sed -n 's/^BROWSER_PROFILE=//p' "$CONF_DIR/doorman.conf" | tail -n 1)"
+fi
+if [ -n "$BROWSER_PROFILE" ]; then
+    case "$BROWSER_PROFILE" in
+        "~/"*) BROWSER_PROFILE="$DAILY_HOME/${BROWSER_PROFILE#\~/}" ;;
+        /*) ;;
+        *) echo "error: --browser-profile must be an absolute path or start with ~/" >&2; exit 2 ;;
+    esac
+    if [ ! -d "$BROWSER_PROFILE" ]; then
+        echo "warning: browser profile $BROWSER_PROFILE does not exist yet; Helium will create it" >&2
+    fi
 fi
 
 PACMAN=(pacman -S --needed)
@@ -343,6 +369,8 @@ for f in addon.py strict_proxy.py rules.py allowlist.txt downloads.conf \
     fi
 done
 run install -m 755 "$PROJECT_DIR/scripts/doorman-firewall.sh" "$PREFIX/scripts/doorman-firewall.sh"
+run install -m 755 "$PROJECT_DIR/scripts/doorman-browser.sh" /usr/local/bin/doorman-browser
+run install -m 755 "$PROJECT_DIR/scripts/doorman-migrate-profile.sh" /usr/local/bin/doorman-migrate-profile
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     run useradd --system --home "$STATE_DIR" --shell /usr/bin/nologin "$SERVICE_USER"
@@ -474,6 +502,7 @@ BROWSER_PORT=$BROWSER_PORT
 STRICT_PORT=$STRICT_PORT
 STRICT_DEFAULT=$STRICT_DEFAULT
 HELIUM_APPIMAGE=$HELIUM_DST
+BROWSER_PROFILE=$BROWSER_PROFILE
 NSS_MODE=$NSS_MODE
 CA_CERT=$CA_CERT
 EOF
@@ -544,20 +573,7 @@ ExecStop=/opt/doorman/scripts/doorman-firewall.sh revert --table doorman
 WantedBy=multi-user.target
 EOF
 
-write_file /usr/local/bin/doorman-browser 755 <<'EOF'
-#!/bin/sh
-set -eu
-APP="${DOORMAN_HELIUM_APPIMAGE:-/opt/doorman/Helium.AppImage}"
-PROFILE="${DOORMAN_HELIUM_PROFILE:-$HOME/.config/doorman-helium}"
-NSSDIR="${DOORMAN_NSSDB:-$HOME/.config/doorman/nssdb}"
-# NSS_DEFAULT_DB_TYPE must be set before Helium starts, otherwise NSS may
-# initialize an incompatible database under NSSDIR.
-if [ -d "$NSSDIR" ]; then
-    export NSS_DEFAULT_DB_TYPE=sql
-    export NSS_LIB_PARAMS="configdir=$NSSDIR"
-fi
-exec "$APP" --user-data-dir="$PROFILE" --proxy-server="http://127.0.0.1:8080" "$@"
-EOF
+# doorman-browser is installed from scripts/doorman-browser.sh above.
 
 write_file /usr/local/bin/doorman-run 755 <<'EOF'
 #!/bin/sh
@@ -673,6 +689,7 @@ fi
 cat >&2 <<EOF
 
   browser : /usr/local/bin/doorman-browser  (Helium, proxy :$BROWSER_PORT)
+  profile : ${BROWSER_PROFILE:-Helium default profile}
   browser rules: /etc/doorman/allowlist.txt, /etc/doorman/downloads.conf
   steam   : /usr/local/bin/doorman-run steam
   policy  : /etc/doorman/strict_allowlist.txt (default $STRICT_DEFAULT)
@@ -695,6 +712,19 @@ fi
 if [ "$ADMIN_ENABLED" = 1 ] && [ "$DRY_RUN" = 0 ]; then
     echo "admin account '$ADMIN_USER' is in wheel; log in as it once to verify" >&2
     echo "before removing wheel from $DAILY_USER." >&2
+fi
+
+if [ -z "$BROWSER_PROFILE" ]; then
+    for old_profile in "$DAILY_HOME/.config/doorman-helium" \
+                      "$DAILY_HOME/.config/helium-blocker-profile"; do
+        if [ -d "$old_profile" ]; then
+            echo "warning: found an older browser profile: $old_profile" >&2
+            echo "         doorman-browser uses Helium's normal profile now." >&2
+            echo "         If your logins are there, close Helium and run:" >&2
+            echo "           doorman-migrate-profile --from $old_profile" >&2
+            echo "         or reinstall with: --browser-profile $old_profile" >&2
+        fi
+    done
 fi
 
 cat >&2 <<EOF

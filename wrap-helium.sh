@@ -8,7 +8,8 @@ REAL_HELIUM="${REAL_HELIUM:-$HOME/app-images/helium}"
 PROXY_HOST="127.0.0.1"
 PROXY_PORT="8080"
 PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
-PROFILE="$HOME/.config/helium-blocker-profile"
+# Use Helium's normal profile so logins carry over, like doorman-browser.
+# Do not add --user-data-dir here: that creates a separate profile.
 LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -24,6 +25,7 @@ MAX_LOG_BYTES=5000000
 
 mkdir -p "$LOG_DIR"
 die() { echo "error: $*" >&2; exit 1; }
+[ "$(id -u)" -ne 0 ] || die "run this as your desktop user, not root"
 
 install_launcher() {
   local link="$LOCAL_BIN/helium"
@@ -49,6 +51,25 @@ port_open() {
 [ -f "$ADDON" ]       || die "$ADDON not found"
 [ -x "$MITMDUMP" ]    || die "$MITMDUMP not found. Create the venv first:
   python3 -m venv $PROJECT_DIR/.venv && $PROJECT_DIR/.venv/bin/pip install mitmproxy"
+
+if pgrep -u "$(id -u)" -x helium >/dev/null 2>&1; then
+  die "Helium is already running. Close it completely, then start it again so the proxy applies."
+fi
+
+# Use the same optional profile as doorman-browser; empty means the normal
+# Helium profile.
+CONF="${DOORMAN_CONF:-/etc/doorman/doorman.conf}"
+PROFILE=""
+if [ -r "$CONF" ]; then
+  PROFILE="$(sed -n 's/^BROWSER_PROFILE=//p' "$CONF" | tail -n 1)"
+fi
+case "$PROFILE" in
+  "~/"*) PROFILE="$HOME/${PROFILE#\~/}" ;;
+esac
+PROFILE_ARGS=()
+if [ -n "$PROFILE" ]; then
+  PROFILE_ARGS=(--user-data-dir="$PROFILE")
+fi
 
 install_launcher
 
@@ -114,6 +135,4 @@ else
   PROXY_STARTED=1
 fi
 
-"$REAL_HELIUM" "$@" \
-  --user-data-dir="$PROFILE" \
-  --proxy-server="$PROXY_URL"
+"$REAL_HELIUM" "${PROFILE_ARGS[@]}" --proxy-server="$PROXY_URL" "$@"
