@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply a test-only nftables policy for one UID.
+# Apply a reversible nftables policy for one UID.
 #
 #   sudo scripts/doorman-firewall.sh apply --user doorman-test
 #   scripts/doorman-firewall.sh print --user doorman-test
@@ -157,9 +157,22 @@ case "$ACTION" in
             && ! ss -ltnH "sport = :$PORT" | grep -q .; then
             echo "warning: nothing is listening on port $PORT; start strict_proxy.py first" >&2
         fi
-        nft delete table inet "$TABLE" 2>/dev/null || true
-        rules | nft -f -
-        echo "applied table inet $TABLE for uid $TARGET_UID mode $MODE" >&2
+        # Build the full ruleset first and validate it. Deleting the old
+        # table and adding the new one in the same nft transaction means a
+        # failure leaves the previous firewall in place instead of opening
+        # the network.
+        TMP_RULES="$(mktemp "${TMPDIR:-/tmp}/doorman-rules.XXXXXX")"
+        trap 'rm -f "$TMP_RULES"' EXIT
+        if nft list table inet "$TABLE" >/dev/null 2>&1; then
+            printf 'delete table inet %s\n' "$TABLE" >"$TMP_RULES"
+        fi
+        rules >>"$TMP_RULES"
+        if ! nft -c -f "$TMP_RULES"; then
+            echo "error: generated rules did not validate; existing firewall left untouched" >&2
+            exit 1
+        fi
+        nft -f "$TMP_RULES"
+        echo "applied table inet $TABLE for uid $TARGET_UID mode $MODE (atomic)" >&2
         echo "verify with: sudo $0 status --table $TABLE" >&2
         ;;
     status)

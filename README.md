@@ -40,12 +40,15 @@ doorman-run steam      # Steam through the strict proxy on :8081
 strict proxy; `allowlist.txt` and `downloads.conf` control the browser. They
 are created from the project files on first install and preserved afterwards,
 so edits survive a reinstall; use `--force` to regenerate them. Edit a file and
-restart the matching service:
+reload or restart the matching service:
 
 ```bash
-sudo systemctl restart doorman-browser   # allowlist.txt, downloads.conf
-sudo systemctl restart doorman-strict    # strict_allowlist.txt
+sudo systemctl reload doorman-strict     # strict_allowlist.txt (or restart)
+sudo systemctl restart doorman-browser   # downloads.conf
 ```
+
+Browser `allowlist.txt` changes are picked up on the next request; only
+`downloads.conf` needs the browser restart.
 
 Uninstall:
 
@@ -75,7 +78,7 @@ repo copies are defaults; the installer copies them to `/etc/doorman` on first
 install and preserves edits. Entries are hostnames; a scheme or port in an
 entry is ignored, so the host is exempt on every port. An empty
 `downloads.conf` blocks every download. Restart `doorman-browser` after
-editing either file.
+editing `downloads.conf` (allowlist edits apply on the next request).
 
 ## Everything else
 
@@ -126,7 +129,9 @@ sudo scripts/doorman-firewall.sh status
 sudo scripts/doorman-firewall.sh revert
 ```
 
-`--print` shows the generated rules without root.
+`print` shows the generated rules without root. `apply` validates the ruleset
+and replaces the table in one nft transaction, so a failed apply leaves the
+existing firewall untouched.
 
 ## Tests
 

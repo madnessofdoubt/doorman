@@ -5,6 +5,8 @@ from urllib.parse import unquote, urlparse
 
 from mitmproxy import ctx, http
 
+from rules import load_host_list, matches, normalize_host
+
 BASE_DIR = Path(__file__).parent
 CONFIG_DIR = Path(os.environ.get("DOORMAN_CONFIG_DIR", "/etc/doorman"))
 
@@ -125,47 +127,21 @@ INLINE_TYPES: set[str] = {
 }
 
 
-def normalize_host(value: str) -> str:
-    """Hostname from a list entry or request host, without scheme or port."""
-    value = value.strip().lower().rstrip(".")
-    if not value:
-        return ""
-    if "://" in value:
-        try:
-            value = urlparse(value).hostname or ""
-        except ValueError:
-            return ""
-    elif value.startswith("["):
-        end = value.find("]")
-        if end != -1:
-            value = value[1:end]
-    elif value.count(":") == 1:
-        host, _, port = value.rpartition(":")
-        if port.isdigit():
-            value = host
-    value = value.rstrip(".")
-    return value[2:] if value.startswith("*.") else value
+_allowlist_cache: tuple[int, set[str]] | None = None
 
 
 def allowlist() -> set[str]:
+    """Browser-exempt hosts, re-read only when the file changes."""
+    global _allowlist_cache
+    path = config_path("allowlist.txt")
     try:
-        text = config_path("allowlist.txt").read_text(encoding="utf-8")
+        mtime = path.stat().st_mtime_ns
     except OSError:
         return set()
 
-    result = set()
-    for line in text.splitlines():
-        entry = normalize_host(line.split("#", 1)[0])
-        if entry:
-            result.add(entry)
-    return result
-
-
-def matches(host: str, entries: set[str]) -> bool:
-    if not host or not entries:
-        return False
-    host = normalize_host(host)
-    return any(host == e or host.endswith("." + e) for e in entries)
+    if _allowlist_cache is None or _allowlist_cache[0] != mtime:
+        _allowlist_cache = (mtime, load_host_list(path))
+    return _allowlist_cache[1]
 
 
 def referer_host(flow: http.HTTPFlow) -> str:

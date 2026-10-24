@@ -12,6 +12,7 @@ the SNI in the ClientHello is read, then bytes are piped untouched.
 import argparse
 import asyncio
 import re
+import signal
 import sys
 from pathlib import Path
 
@@ -26,33 +27,35 @@ MAX_SNI_PEEK = 16 * 1024
 
 
 def parse_sni(data: bytes) -> str | None:
-    """SNI hostname from a TLS ClientHello, or None if absent/incomplete."""
+    """SNI hostname from a TLS ClientHello, or None if absent/malformed."""
     if len(data) < 9 or data[0] != TLS_HANDSHAKE or data[5] != TLS_CLIENT_HELLO:
         return None
 
-    end = 9 + ((data[6] << 16) | (data[7] << 8) | data[8])
+    # Clamp the declared length to the bytes actually read. A truncated
+    # ClientHello must never make the parser index past its buffer.
+    end = min(9 + ((data[6] << 16) | (data[7] << 8) | data[8]), len(data))
     i = 9 + 2 + 32  # handshake header, then client version + random
-    if i >= len(data) or i >= end:
+    if i >= end:
         return None
 
     i += 1 + data[i]  # session id
     if i + 2 > end:
         return None
-    i += 2 + ((data[i] << 8) | data[i + 1])  # extensions
+    i += 2 + ((data[i] << 8) | data[i + 1])  # cipher suites
     if i >= end:
         return None
     i += 1 + data[i]  # compression methods
     if i + 2 > end:
         return None
-    extensions_end = i + 2 + ((data[i] << 8) | data[i + 1])
+    extensions_end = min(i + 2 + ((data[i] << 8) | data[i + 1]), end)
     i += 2
 
-    while i + 4 <= min(extensions_end, len(data)):
+    while i + 4 <= extensions_end:
         ext_type = (data[i] << 8) | data[i + 1]
         ext_len = (data[i + 2] << 8) | data[i + 3]
         i += 4
         if ext_type == 0x0000:  # server_name
-            if i + 5 > len(data):
+            if i + 5 > extensions_end:
                 return None
             name_len = (data[i + 3] << 8) | data[i + 4]
             name = data[i + 5 : i + 5 + name_len]
@@ -82,6 +85,38 @@ def header_target(headers: bytes, default_port: int) -> tuple[str | None, int]:
     return value, default_port
 
 
+def parse_connect_target(target: str) -> tuple[str, int] | None:
+    """Host and port from CONNECT authority form, bracketed IPv6 included."""
+    target = target.strip()
+    if not target:
+        return None
+
+    if target.startswith("["):
+        host, sep, rest = target[1:].partition("]")
+        if not sep:
+            return None
+        if not rest:
+            port = 443
+        elif rest.startswith(":") and rest[1:].isdigit():
+            port = int(rest[1:])
+        else:
+            return None
+    elif ":" in target:
+        host, _, port_text = target.rpartition(":")
+        if not port_text.isdigit():
+            return None
+        port = int(port_text)
+    else:
+        host, port = target, 443
+
+    host = host.strip().lower().rstrip(".")
+    if not host or not 1 <= port <= 65535:
+        return None
+    if ":" in host and not target.startswith("["):
+        return None  # unbracketed IPv6 is not a valid authority
+    return host, port
+
+
 class Guard:
     def __init__(self, allowlist: Path, mode: str, default: str = "deny") -> None:
         self.allowlist = allowlist
@@ -90,7 +125,10 @@ class Guard:
         self.allowed = load_host_list(allowlist)
 
     def reload(self) -> None:
-        self.allowed = load_host_list(self.allowlist)
+        hosts = load_host_list(self.allowlist)
+        if not hosts and not self.allowlist.exists():
+            print(f"WARN allowlist missing: {self.allowlist}", flush=True)
+        self.allowed = hosts
 
     def permit(self, host: str) -> bool:
         """Policy answer, before dry-run is applied."""
@@ -99,7 +137,7 @@ class Guard:
     def decide(self, host: str | None) -> bool:
         """Log one decision for host; return whether it may pass."""
         ok = self.permit(host or "")
-        verdict = "ALLOW" if ok else "DENY "
+        verdict = "ALLOW" if ok else "DENY"
         if not ok and self.mode == "log":
             verdict = "DRYRUN"
         print(f"{verdict} {host or '-'}", flush=True)
@@ -110,6 +148,10 @@ class Guard:
             await self.route(reader, writer)
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
+        except asyncio.LimitOverrunError:
+            print("WARN request headers too large", flush=True)
+        except Exception as exc:  # one malformed client must not kill the task
+            print(f"ERROR {type(exc).__name__}: {exc}", flush=True)
         finally:
             writer.close()
 
@@ -131,16 +173,29 @@ class Guard:
         headers = first + await reader.readuntil(b"\r\n\r\n")
         line = headers.split(b"\r\n", 1)[0]
         if line.startswith(b"CONNECT "):
-            target = line.split()[1].decode("ascii", "replace")
-            host, _, port = target.rpartition(":")
-            if not self.decide(host or None):
+            parts = line.split()
+            target = (
+                parse_connect_target(parts[1].decode("ascii", "replace"))
+                if len(parts) > 1
+                else None
+            )
+            if target is None:
+                print("BAD CONNECT target", flush=True)
+                writer.write(
+                    b"HTTP/1.1 400 Bad Request\r\n"
+                    b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                await writer.drain()
+                return
+            host, port = target
+            if not self.decide(host):
                 writer.write(
                     b"HTTP/1.1 403 Forbidden\r\n"
                     b"Content-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 await writer.drain()
                 return
-            await self.tunnel(reader, writer, b"", host, int(port or 443), reply=True)
+            await self.tunnel(reader, writer, b"", host, port, reply=True)
             return
 
         host, port = request_target(line)
@@ -211,9 +266,24 @@ class Guard:
         await asyncio.gather(copy(reader, up_writer), copy(up_reader, writer))
 
 
+def install_sighup(guard: Guard) -> None:
+    """Reload the allowlist on SIGHUP, for `systemctl reload doorman-strict`."""
+
+    def reload() -> None:
+        before = len(guard.allowed)
+        guard.reload()
+        print(f"RELOAD allowlisted={len(guard.allowed)} (was {before})", flush=True)
+
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGHUP, reload)
+    except (NotImplementedError, RuntimeError):
+        pass
+
+
 async def main(args) -> None:
     guard = Guard(args.allowlist, args.mode, args.default)
     server = await asyncio.start_server(guard.handle, args.listen_host, args.listen_port)
+    install_sighup(guard)
     print(
         f"strict proxy on {args.listen_host}:{args.listen_port} "
         f"mode={args.mode} default={args.default} "

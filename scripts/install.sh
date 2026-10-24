@@ -501,6 +501,7 @@ ReadWritePaths=/var/lib/doorman
 WantedBy=multi-user.target
 EOF
 
+# This heredoc is expanded by the installer, so $MAINPID is escaped below.
 write_file /etc/systemd/system/doorman-strict.service 644 <<EOF
 [Unit]
 Description=doorman strict host allowlist proxy
@@ -517,6 +518,7 @@ Group=doorman
 ExecStart=/opt/doorman/.venv/bin/python /opt/doorman/strict_proxy.py --listen-host 127.0.0.1 --listen-port $STRICT_PORT --allowlist /etc/doorman/strict_allowlist.txt --default $STRICT_DEFAULT
 Restart=on-failure
 RestartSec=2s
+ExecReload=/bin/kill -HUP \$MAINPID
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
