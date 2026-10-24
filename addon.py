@@ -1,3 +1,4 @@
+import os
 from email.message import Message
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -5,7 +6,7 @@ from urllib.parse import unquote, urlparse
 from mitmproxy import ctx, http
 
 BASE_DIR = Path(__file__).parent
-ALLOWLIST_FILE = BASE_DIR / "allowlist.txt"
+CONFIG_DIR = Path(os.environ.get("DOORMAN_CONFIG_DIR", "/etc/doorman"))
 
 BLOCKED_HOSTS = {
     "example.com",
@@ -68,9 +69,48 @@ DOWNLOAD_EXTENSIONS = {
     ".tar.zst", ".tar.zst.sig", ".iso.torrent",
 }
 
-# Empty sets must use set(); a non-empty set uses {"..."}.
-ALLOWED_DOWNLOAD_TYPES: set[str] = set()
-ALLOWED_DOWNLOAD_EXTENSIONS: set[str] = {".tar.zst", ".appimage", ".crx", ".iso"}
+
+def config_path(name: str) -> Path:
+    """Config in /etc/doorman when installed, otherwise beside addon.py.
+
+    No per-file fallback: once /etc/doorman exists, a missing rule file means
+    an empty policy, not the old packaged defaults.
+    """
+    return (CONFIG_DIR if CONFIG_DIR.is_dir() else BASE_DIR) / name
+
+
+def parse_downloads(text: str) -> tuple[set[str], set[str]]:
+    """Allowed download types and extensions from downloads.conf.
+
+    Format: 'type <mime>' and 'ext <suffix>', one per line. '#' comments.
+    Unknown lines are ignored so a typo cannot silently allow everything.
+    """
+    types: set[str] = set()
+    extensions: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, value = parts
+        value = value.strip().lower()
+        if key.lower() == "type":
+            types.add(value.split(";", 1)[0].strip())
+        elif key.lower() == "ext":
+            extensions.add(value if value.startswith(".") else "." + value)
+    return types, extensions
+
+
+try:
+    ALLOWED_DOWNLOAD_TYPES, ALLOWED_DOWNLOAD_EXTENSIONS = parse_downloads(
+        config_path("downloads.conf").read_text(encoding="utf-8")
+    )
+except OSError:
+    # Missing config means no downloads are allowed.
+    ALLOWED_DOWNLOAD_TYPES, ALLOWED_DOWNLOAD_EXTENSIONS = set(), set()
+
 
 # Consumed by the page even when Google labels it attachment.
 INLINE_TYPES: set[str] = {
@@ -109,8 +149,8 @@ def normalize_host(value: str) -> str:
 
 def allowlist() -> set[str]:
     try:
-        text = ALLOWLIST_FILE.read_text(encoding="utf-8")
-    except FileNotFoundError:
+        text = config_path("allowlist.txt").read_text(encoding="utf-8")
+    except OSError:
         return set()
 
     result = set()
@@ -269,8 +309,12 @@ def announce_config() -> None:
         return
     _config_checked = True
 
-    if not ALLOWLIST_FILE.exists():
-        ctx.log.warn(f"allowlist NOT FOUND: {ALLOWLIST_FILE} - nothing is exempt")
+    allowlist_file = config_path("allowlist.txt")
+    downloads_file = config_path("downloads.conf")
+    if not allowlist_file.exists():
+        ctx.log.warn(f"allowlist NOT FOUND: {allowlist_file} - nothing is exempt")
+    if not downloads_file.exists():
+        ctx.log.warn(f"downloads NOT FOUND: {downloads_file} - all downloads blocked")
 
     ctx.log.info(
         f"config: {len(BLOCKED_HOSTS)} blocked hosts, "
@@ -280,6 +324,7 @@ def announce_config() -> None:
         f"{len(ALLOWED_DOWNLOAD_TYPES)} allowed types, "
         f"{len(ALLOWED_DOWNLOAD_EXTENSIONS)} allowed extensions"
     )
+    ctx.log.info(f"config files: allowlist {allowlist_file}, downloads {downloads_file}")
 
 
 # --- hooks ---------------------------------------------------------------

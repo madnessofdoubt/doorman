@@ -52,8 +52,8 @@ options:
   --helium PATH           Helium AppImage to install
   --enforce               apply the per-UID firewall and enable its unit
   --ttl DURATION          auto-revert enforcement after DURATION (e.g. 15m)
-  --default deny|allow    policy for hosts on neither list (default: deny)
-                          deny = allowlist-only; allow = blocklist-only
+  --default deny|allow    policy for hosts not on the allowlist (default: deny)
+                          deny = allowlist-only; allow = allow everything
   --remove-wheel          remove the daily user from wheel (explicit!)
   --trust-ca              install the CA system-wide and in the daily NSS DB
   --no-trust-ca           do not install the CA (browser MITM will fail)
@@ -318,12 +318,26 @@ if [ ! -x "$PREFIX/.venv/bin/python" ]; then
     run python -m venv "$PREFIX/.venv"
 fi
 if [ ! -x "$PREFIX/.venv/bin/mitmdump" ]; then
+    # A half-removed venv can keep bin/python without pip, which makes the
+    # install fail later with "No module named pip". Rebuild it instead.
+    if [ "$DRY_RUN" = 0 ] && \
+        ! "$PREFIX/.venv/bin/python" -m pip --version >/dev/null 2>&1; then
+        echo "venv at $PREFIX/.venv has no pip; recreating it" >&2
+        run rm -rf "$PREFIX/.venv"
+        run python -m venv "$PREFIX/.venv"
+        if ! "$PREFIX/.venv/bin/python" -m pip --version >/dev/null 2>&1; then
+            run "$PREFIX/.venv/bin/python" -m ensurepip --upgrade || {
+                echo "error: could not bootstrap pip in $PREFIX/.venv" >&2
+                exit 1
+            }
+        fi
+    fi
     run "$PREFIX/.venv/bin/python" -m pip install --upgrade pip
     run "$PREFIX/.venv/bin/pip" install mitmproxy
 fi
 
-for f in addon.py strict_proxy.py rules.py allowlist.txt strict_allowlist.txt \
-         steam_allowlist.txt steam_blocklist.txt; do
+for f in addon.py strict_proxy.py rules.py allowlist.txt downloads.conf \
+         strict_allowlist.txt steam_allowlist.txt; do
     if [ -f "$PROJECT_DIR/$f" ]; then
         run install -m 644 "$PROJECT_DIR/$f" "$PREFIX/$f"
     fi
@@ -445,9 +459,11 @@ if [ ! -f "$CONF_DIR/strict_allowlist.txt" ] || [ "$FORCE" = 1 ]; then
         "$PROJECT_DIR/strict_allowlist.txt" \
         "$PROJECT_DIR/steam_allowlist.txt"
 fi
-if [ ! -f "$CONF_DIR/strict_blocklist.txt" ] || [ "$FORCE" = 1 ]; then
-    merge_allowlists "$CONF_DIR/strict_blocklist.txt" \
-        "$PROJECT_DIR/steam_blocklist.txt"
+if [ ! -f "$CONF_DIR/allowlist.txt" ] || [ "$FORCE" = 1 ]; then
+    run install -m 644 "$PROJECT_DIR/allowlist.txt" "$CONF_DIR/allowlist.txt"
+fi
+if [ ! -f "$CONF_DIR/downloads.conf" ] || [ "$FORCE" = 1 ]; then
+    run install -m 644 "$PROJECT_DIR/downloads.conf" "$CONF_DIR/downloads.conf"
 fi
 
 write_file "$CONF_DIR/doorman.conf" 644 <<EOF
@@ -498,7 +514,7 @@ StartLimitBurst=3
 Type=simple
 User=doorman
 Group=doorman
-ExecStart=/opt/doorman/.venv/bin/python /opt/doorman/strict_proxy.py --listen-host 127.0.0.1 --listen-port $STRICT_PORT --allowlist /etc/doorman/strict_allowlist.txt --blocklist /etc/doorman/strict_blocklist.txt --default $STRICT_DEFAULT
+ExecStart=/opt/doorman/.venv/bin/python /opt/doorman/strict_proxy.py --listen-host 127.0.0.1 --listen-port $STRICT_PORT --allowlist /etc/doorman/strict_allowlist.txt --default $STRICT_DEFAULT
 Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true
@@ -655,15 +671,18 @@ fi
 cat >&2 <<EOF
 
   browser : /usr/local/bin/doorman-browser  (Helium, proxy :$BROWSER_PORT)
+  browser rules: /etc/doorman/allowlist.txt, /etc/doorman/downloads.conf
   steam   : /usr/local/bin/doorman-run steam
   policy  : /etc/doorman/strict_allowlist.txt (default $STRICT_DEFAULT)
-  block   : /etc/doorman/strict_blocklist.txt
   logs    : journalctl -u doorman-browser -u doorman-strict
   firewall: systemctl status doorman-firewall
 
-With --default deny (the default) the strict allowlist decides everything
-outside the blocklist. With --default allow, everything is allowed except the
-blocklist. Edit files in /etc/doorman and restart doorman-strict after changes.
+With --default deny (the default) the strict allowlist decides everything.
+With --default allow, every host is allowed. Edit files in /etc/doorman and
+restart the matching service:
+
+  doorman-browser -> allowlist.txt, downloads.conf
+  doorman-strict  -> strict_allowlist.txt
 
 EOF
 

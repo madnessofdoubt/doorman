@@ -2,7 +2,7 @@
 # Run an app with its traffic sent to the strict proxy.
 #
 #   scripts/doorman-run.sh steam
-#   scripts/doorman-run.sh --blocklist steam_blocklist.txt --default allow steam
+#   scripts/doorman-run.sh --allowlist steam_allowlist.txt --default deny steam
 #   scripts/doorman-run.sh --restart -- steam --some-flag
 #
 # The proxy is started if it is not already listening, and stopped on exit.
@@ -19,7 +19,6 @@ PROXY_PIDFILE="$LOG_DIR/strict-proxy.pid"
 HOST=127.0.0.1
 PORT=8081
 ALLOWLIST="$PROJECT_DIR/strict_allowlist.txt"
-BLOCKLIST=""
 DEFAULT_ORDER=deny
 STARTUP_TIMEOUT=5
 
@@ -29,8 +28,7 @@ usage: doorman-run.sh [options] -- command [args...]
 
 options:
   --allowlist FILE   host list for the proxy (default: strict_allowlist.txt)
-  --blocklist FILE   hosts to refuse, even with --default allow
-  --default deny|allow  policy when the allowlist is empty (default: deny)
+  --default deny|allow  policy for hosts not on the allowlist (default: deny)
   --port N           proxy port (default: 8081)
   --restart          restart the proxy even if one is already running
   -h, --help         show this help
@@ -46,7 +44,6 @@ RESTART=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --allowlist) ALLOWLIST="$2"; shift 2 ;;
-        --blocklist) BLOCKLIST="$2"; shift 2 ;;
         --default) DEFAULT_ORDER="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --restart) RESTART=1; shift ;;
@@ -61,7 +58,6 @@ done
 [ -x "$PYTHON" ] || { echo "missing $PYTHON; create the venv first" >&2; exit 1; }
 [ -f "$PROXY" ] || { echo "missing $PROXY" >&2; exit 1; }
 [ -f "$ALLOWLIST" ] || { echo "missing allowlist: $ALLOWLIST" >&2; exit 1; }
-[ -z "$BLOCKLIST" ] || [ -f "$BLOCKLIST" ] || { echo "missing blocklist: $BLOCKLIST" >&2; exit 1; }
 
 mkdir -p "$LOG_DIR"
 
@@ -92,7 +88,6 @@ stop_existing() {
 start_proxy() {
     echo "starting proxy on ${HOST}:${PORT} (default ${DEFAULT_ORDER})..." >&2
     PROXY_ARGS=(--allowlist "$ALLOWLIST" --default "$DEFAULT_ORDER")
-    [ -z "$BLOCKLIST" ] || PROXY_ARGS+=(--blocklist "$BLOCKLIST")
     nohup "$PYTHON" "$PROXY" "${PROXY_ARGS[@]}" --listen-host "$HOST" \
         --listen-port "$PORT" >>"$PROXY_LOG" 2>&1 &
     local pid=$!

@@ -54,32 +54,17 @@ class RulesTest(unittest.TestCase):
 
 class PolicyTest(unittest.TestCase):
     def test_strict_default_denies_everything(self) -> None:
-        self.assertFalse(allowed("anything.com", set(), set(), "deny"))
-        self.assertTrue(allowed("anything.com", set(), set(), "allow"))
-
-    def test_blocklist_wins_over_allowlist(self) -> None:
-        allow, block = {"example.com"}, {"example.com"}
-        self.assertFalse(allowed("example.com", allow, block, "deny"))
-
-    def test_default_allow_with_blocklist(self) -> None:
-        block = {"steampowered.com"}
-        self.assertFalse(allowed("store.steampowered.com", set(), block, "allow"))
-        self.assertFalse(allowed("api.steampowered.com", set(), block, "allow"))
-        self.assertTrue(allowed("steamcommunity.com", set(), block, "allow"))
+        self.assertFalse(allowed("anything.com", set(), "deny"))
+        self.assertTrue(allowed("anything.com", set(), "allow"))
 
     def test_default_applies_with_nonempty_allowlist(self) -> None:
         allow = {"example.com"}
-        self.assertTrue(allowed("steamcommunity.com", allow, set(), "allow"))
-        self.assertFalse(allowed("steamcommunity.com", allow, set(), "deny"))
-        self.assertTrue(allowed("www.example.com", allow, set(), "deny"))
-
-    def test_subdomain_block_does_not_hit_siblings(self) -> None:
-        block = {"store.steampowered.com"}
-        self.assertFalse(allowed("store.steampowered.com", set(), block, "allow"))
-        self.assertTrue(allowed("checkout.steampowered.com", set(), block, "allow"))
+        self.assertTrue(allowed("steamcommunity.com", allow, "allow"))
+        self.assertFalse(allowed("steamcommunity.com", allow, "deny"))
+        self.assertTrue(allowed("www.example.com", allow, "deny"))
 
     def test_empty_host_is_never_allowed(self) -> None:
-        self.assertFalse(allowed("", set(), set(), "allow"))
+        self.assertFalse(allowed("", set(), "allow"))
 
 
 class SniTest(unittest.TestCase):

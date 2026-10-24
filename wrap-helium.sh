@@ -3,6 +3,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/Projects/doorman}"
+export DOORMAN_CONFIG_DIR="$PROJECT_DIR"
 REAL_HELIUM="${REAL_HELIUM:-$HOME/app-images/helium}"
 PROXY_HOST="127.0.0.1"
 PROXY_PORT="8080"

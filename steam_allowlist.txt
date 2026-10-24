@@ -6,7 +6,8 @@
 #   journalctl -u doorman-strict -f
 #
 # The store shares steampowered.com with login and APIs, so it is allowed too.
-# The in-game overlay browser can reach these hosts but nothing else.
+# The in-game overlay browser shares this path and cannot reach hosts outside
+# this list.
 #
 # The installer merges this file into /etc/doorman/strict_allowlist.txt.
 
@@ -23,7 +24,7 @@ steamusercontent.com
 steamcommunity-a.akamaihd.net
 steamuserimages-a.akamaihd.net
 
-# Store images, avatars, and trailers (trailers are blocked separately).
+# Store images, avatars, and trailers.
 steamstatic.com
 
 # Game downloads.

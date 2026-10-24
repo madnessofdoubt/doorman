@@ -34,17 +34,13 @@ def host_key(host: str) -> str:
     return (host or "").lower().rstrip(".")
 
 
-def allowed(host: str, allow: set[str], block: set[str], default: str = "deny") -> bool:
-    """Blocklist wins, then the allowlist, then `default`.
+def allowed(host: str, allow: set[str], default: str = "deny") -> bool:
+    """Allowlist first, then `default`.
 
-    `default` is the policy for hosts on neither list: "deny" is
-    allowlist-only, "allow" is blocklist-only. It applies even when the
-    allowlist is non-empty; otherwise a populated allowlist would silently
-    override default=allow."""
+    `default` is the policy for hosts not on the allowlist: "deny" is
+    allowlist-only, "allow" allows everything."""
     host = host_key(host)
     if not host:
-        return False
-    if block and matches(host, block):
         return False
     if allow and matches(host, allow):
         return True

@@ -3,6 +3,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/Projects/doorman}"
+export DOORMAN_CONFIG_DIR="$PROJECT_DIR"
 REAL_CHROMIUM="${REAL_CHROMIUM:-/usr/bin/chromium}"
 PROXY_HOST="127.0.0.1"
 PROXY_PORT="8080"

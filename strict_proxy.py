@@ -83,22 +83,18 @@ def header_target(headers: bytes, default_port: int) -> tuple[str | None, int]:
 
 
 class Guard:
-    def __init__(self, allowlist: Path, blocklist: Path | None, mode: str,
-                 default: str = "deny") -> None:
+    def __init__(self, allowlist: Path, mode: str, default: str = "deny") -> None:
         self.allowlist = allowlist
-        self.blocklist = blocklist
         self.mode = mode  # "log" or "enforce"
-        self.default = default  # policy for hosts on neither list
+        self.default = default  # policy for hosts not on the allowlist
         self.allowed = load_host_list(allowlist)
-        self.blocked = load_host_list(blocklist) if blocklist else set()
 
     def reload(self) -> None:
         self.allowed = load_host_list(self.allowlist)
-        self.blocked = load_host_list(self.blocklist) if self.blocklist else set()
 
     def permit(self, host: str) -> bool:
         """Policy answer, before dry-run is applied."""
-        return allowed(host or "", self.allowed, self.blocked, self.default)
+        return allowed(host or "", self.allowed, self.default)
 
     def decide(self, host: str | None) -> bool:
         """Log one decision for host; return whether it may pass."""
@@ -216,12 +212,12 @@ class Guard:
 
 
 async def main(args) -> None:
-    guard = Guard(args.allowlist, args.blocklist, args.mode, args.default)
+    guard = Guard(args.allowlist, args.mode, args.default)
     server = await asyncio.start_server(guard.handle, args.listen_host, args.listen_port)
     print(
         f"strict proxy on {args.listen_host}:{args.listen_port} "
         f"mode={args.mode} default={args.default} "
-        f"allowlisted={len(guard.allowed)} blocked={len(guard.blocked)} logged",
+        f"allowlisted={len(guard.allowed)} logged",
         flush=True,
     )
     async with server:
@@ -231,15 +227,14 @@ async def main(args) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
-    parser.add_argument("--blocklist", type=Path, default=None)
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=8081)
     parser.add_argument(
         "--default",
         choices=("deny", "allow"),
         default="deny",
-        help="policy for hosts on neither list: deny (allowlist-only) "
-        "or allow (blocklist-only) (default: deny)",
+        help="policy for hosts not on the allowlist: deny (allowlist-only) "
+        "or allow (allow everything) (default: deny)",
     )
     parser.add_argument(
         "--dry-run",

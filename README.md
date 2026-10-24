@@ -36,10 +36,16 @@ doorman-browser        # Helium through the MITM proxy on :8080
 doorman-run steam      # Steam through the strict proxy on :8081
 ```
 
-`/etc/doorman/strict_allowlist.txt` and `/etc/doorman/strict_blocklist.txt`
-are generated from the project lists. Edit them and restart
-`doorman-strict` to change the policy. There is one strict proxy for all
-non-browser apps.
+`/etc/doorman` holds the live rules. `strict_allowlist.txt` controls the
+strict proxy; `allowlist.txt` and `downloads.conf` control the browser. They
+are created from the project files on first install and preserved afterwards,
+so edits survive a reinstall; use `--force` to regenerate them. Edit a file and
+restart the matching service:
+
+```bash
+sudo systemctl restart doorman-browser   # allowlist.txt, downloads.conf
+sudo systemctl restart doorman-strict    # strict_allowlist.txt
+```
 
 Uninstall:
 
@@ -63,11 +69,13 @@ Development/manual Chromium:
 ./wrap-chromium.sh
 ```
 
-Uses `allowlist.txt` (fully exempt hosts) and the `ALLOWED_DOWNLOAD_TYPES` /
-`ALLOWED_DOWNLOAD_EXTENSIONS` sets in `addon.py`. In the installed layout the
-browser allowlist is `/opt/doorman/allowlist.txt`. Entries are hostnames; a
-scheme or port in an entry is ignored, so the host is exempt on every port.
-Use `set()` (not `{}`) for an empty allow set; that blocks every download.
+Uses `/etc/doorman/allowlist.txt` (fully exempt hosts) and
+`/etc/doorman/downloads.conf` (allowed download types and extensions). The
+repo copies are defaults; the installer copies them to `/etc/doorman` on first
+install and preserves edits. Entries are hostnames; a scheme or port in an
+entry is ignored, so the host is exempt on every port. An empty
+`downloads.conf` blocks every download. Restart `doorman-browser` after
+editing either file.
 
 ## Everything else
 
@@ -83,8 +91,7 @@ environment.
 Development/manual:
 
 ```bash
-scripts/doorman-run.sh --allowlist steam_allowlist.txt \
-    --blocklist steam_blocklist.txt --default deny -- steam
+scripts/doorman-run.sh --allowlist steam_allowlist.txt --default deny -- steam
 ```
 
 `doorman-run.sh` starts `strict_proxy.py`, exports `http_proxy`/`https_proxy`,
@@ -124,7 +131,7 @@ sudo scripts/doorman-firewall.sh revert
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest -v test_rules
+.venv/bin/python -m unittest -v test_rules test_addon
 ```
 
 ## Files
@@ -134,16 +141,17 @@ sudo scripts/doorman-firewall.sh revert
 | `addon.py` | Browser policy (MITM) |
 | `strict_proxy.py` | Host allowlist proxy (no MITM) |
 | `rules.py` | Shared host matching |
-| `allowlist.txt` | Browser-exempt hosts |
+| `allowlist.txt` | Browser-exempt hosts (default for `/etc/doorman/allowlist.txt`) |
+| `downloads.conf` | Allowed browser download types/extensions (default for `/etc/doorman/downloads.conf`) |
 | `strict_allowlist.txt` | Default strict allowlist; Steam hosts are merged in at install |
 | `steam_allowlist.txt` | Hosts Steam needs under `--default deny` |
-| `steam_blocklist.txt` | Hosts blocked even under `--default allow` (Steam trailers) |
 | `scripts/install.sh` | One-shot Arch installer |
 | `wrap-chromium.sh` | Launch Chromium through the browser proxy |
 | `scripts/doorman-run.sh` | Launch any app through the strict proxy |
 | `scripts/doorman-firewall.sh` | Reversible per-UID nftables test policy |
 | `scripts/doorman-test-user.sh` | Create the throwaway test user |
 | `test_rules.py` | Matcher and SNI parser tests |
+| `test_addon.py` | Browser config parser tests |
 | `policy/` | Chromium enterprise policy |
 
 ## Known gaps
@@ -162,11 +170,10 @@ sudo scripts/doorman-firewall.sh revert
   merges `steam_allowlist.txt` into the strict allowlist. Add any host Steam
   logs as `DENY` while it runs.
 - The Steam store cannot be blocked independently of the login/API hosts on
-  `steampowered.com`. The shipped blocklist therefore only blocks store
-  trailers; the store tab remains reachable.
-- `--default allow` makes the strict proxy blocklist-only. It does not enforce
-  "apps are blocked unless allowed"; use `--default deny` with a populated
-  allowlist for that.
+  `steampowered.com`, so the store tab and its trailers remain reachable.
+- `--default allow` makes the strict proxy allow every host. It does not
+  enforce "apps are blocked unless allowed"; use `--default deny` with a
+  populated allowlist for that.
 - Media and download decisions use headers and URL extensions. A server that
   mislabels a file, or a page that generates a `blob:`/`data:` download, can
   bypass them; inspecting bytes or using browser download policy would be
