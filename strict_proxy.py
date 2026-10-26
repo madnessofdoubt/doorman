@@ -23,6 +23,7 @@ from rules import allowed, load_host_list
 BASE_DIR = Path(__file__).parent
 DEFAULT_ALLOWLIST = BASE_DIR / "strict_allowlist.txt"
 DEFAULT_APPS_DIR = Path("/etc/doorman/apps")
+DEFAULT_APP_PORTS = Path("/etc/doorman/apps/ports.conf")
 APP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 TLS_HANDSHAKE = 0x16
@@ -157,6 +158,34 @@ def strip_proxy_headers(head: bytes) -> bytes:
     return head
 
 
+def load_app_ports(path: Path) -> list[tuple[int, str]]:
+    """Port-to-app mappings from a file of 'port app' lines."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    ports: dict[int, str] = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not parts[0].isdigit():
+            print(f"WARN app port line ignored: {line}", flush=True)
+            continue
+        port = int(parts[0])
+        app = parts[1].lower()
+        if not 1 <= port <= 65535 or not APP_NAME_RE.fullmatch(app):
+            print(f"WARN app port line ignored: {line}", flush=True)
+            continue
+        if port in ports:
+            print(f"WARN duplicate app port ignored: {port}", flush=True)
+            continue
+        ports[port] = app
+    return sorted(ports.items())
+
+
 class Guard:
     def __init__(
         self,
@@ -171,6 +200,7 @@ class Guard:
         self.allowed = load_host_list(allowlist)
         self.apps_dir = apps_dir if apps_dir is not None else DEFAULT_APPS_DIR
         self._app_cache: dict[str, tuple[int, set[str]]] = {}
+        self.pending_head: bytes | None = None
 
     def reload(self) -> None:
         hosts = load_host_list(self.allowlist)
@@ -224,9 +254,16 @@ class Guard:
         )
         await writer.drain()
 
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        app_hint: str | None = None,
+        auth: tuple[str, str] | None = None,
+        upstream: tuple[str, int] | None = None,
+    ) -> None:
         try:
-            await self.route(reader, writer)
+            await self.route(reader, writer, app_hint, auth, upstream)
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
         except asyncio.LimitOverrunError:
@@ -236,9 +273,26 @@ class Guard:
         finally:
             writer.close()
 
-    async def route(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def route(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        app_hint: str | None = None,
+        auth: tuple[str, str] | None = None,
+        upstream: tuple[str, int] | None = None,
+    ) -> None:
         first = await reader.read(1)
         if not first:
+            return
+
+        if auth is not None:
+            # An upstream proxy is configured, so the client may send the
+            # request in any form. Challenge once when it has no credentials.
+            if not await self.prompt_auth(reader, writer):
+                return
+            headers = self.pending_head or b""
+            self.pending_head = None
+            await self.forward(reader, writer, headers, None, 0, auth, upstream)
             return
 
         if first == b"\x16":  # TLS ClientHello: read the record, then peek SNI
@@ -246,14 +300,18 @@ class Guard:
             record_len = (header[3] << 8) | header[4]
             data = header + await reader.readexactly(min(record_len, MAX_SNI_PEEK - 5))
             sni = parse_sni(data)
-            if not self.decide(sni):
+            if not self.decide(sni, app_hint):
                 return
-            await self.tunnel(reader, writer, data, sni, 443, reply=False)
+            await self.tunnel(
+                reader, writer, data, sni, 443, auth, upstream, reply=False
+            )
             return
 
         headers = first + await reader.readuntil(b"\r\n\r\n")
         auth_present, app = parse_proxy_app(headers)
-        if auth_present and app is None:
+        if app_hint:
+            app = app_hint
+        elif auth_present and app is None:
             print("BADAUTH", flush=True)
             await self.auth_required(writer)
             return
@@ -281,7 +339,9 @@ class Guard:
                 )
                 await writer.drain()
                 return
-            await self.tunnel(reader, writer, b"", host, port, reply=True)
+            await self.tunnel(
+                reader, writer, b"", host, port, auth, upstream, reply=True
+            )
             return
 
         host, port = request_target(line)
@@ -294,12 +354,39 @@ class Guard:
             )
             await writer.drain()
             return
-        await self.forward(reader, writer, headers, host, port or 80)
+        await self.forward(reader, writer, headers, host, port or 80, auth, upstream)
 
-    async def tunnel(self, reader, writer, buffered: bytes, host: str, port: int, reply: bool) -> None:
-        """Connect to host:port and pipe bytes both ways untouched."""
+    async def prompt_auth(self, reader, writer) -> bool:
+        """Ask for proxy credentials with a 407, then wait for the real request.
+
+        The challenged request is discarded; only the next header block is
+        forwarded upstream.
+        """
+        await self.auth_required(writer)
         try:
-            up_reader, up_writer = await asyncio.open_connection(host, port)
+            head = await reader.readuntil(b"\r\n\r\n")
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            return False
+        if not head.strip():
+            return False
+        self.pending_head = head
+        return True
+
+    async def tunnel(
+        self,
+        reader,
+        writer,
+        buffered: bytes,
+        host: str | None,
+        port: int,
+        auth=None,
+        upstream: tuple[str, int] | None = None,
+        reply: bool = True,
+    ) -> None:
+        """Connect to host:port (or an upstream proxy) and pipe bytes."""
+        target = upstream if upstream is not None else (host, port)
+        try:
+            up_reader, up_writer = await asyncio.open_connection(*target)
         except OSError as exc:
             print(f"UPSTREAM {host}:{port} failed: {exc}", flush=True)
             if reply:
@@ -315,15 +402,29 @@ class Guard:
         if reply:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
+        if not await self.send_upstream(
+            reader, writer, up_reader, up_writer, buffered, auth
+        ):
+            return
         if buffered:
             up_writer.write(buffered)
             await up_writer.drain()
         await self.pipe(reader, writer, up_reader, up_writer)
 
-    async def forward(self, reader, writer, head: bytes, host: str | None, port: int) -> None:
+    async def forward(
+        self,
+        reader,
+        writer,
+        head: bytes,
+        host: str | None,
+        port: int,
+        auth: tuple[str, str] | None = None,
+        upstream: tuple[str, int] | None = None,
+    ) -> None:
         if not host:
             return
         head = strip_proxy_headers(head)
+        target = upstream if upstream is not None else (host, port)
         # A proxy receives absolute-form requests; origins expect origin-form.
         request_line, sep, rest = head.partition(b"\r\n")
         m = re.match(rb"^([A-Z]+) https?://[^/\s]+([^\s]*) (HTTP/\d\.\d)$", request_line)
@@ -331,15 +432,109 @@ class Guard:
             request_line = b" ".join([m.group(1), m.group(2) or b"/", m.group(3)])
             head = request_line + sep + rest
         try:
-            up_reader, up_writer = await asyncio.open_connection(host, port)
+            up_reader, up_writer = await asyncio.open_connection(*target)
         except OSError as exc:
             print(f"UPSTREAM {host}:{port} failed: {exc}", flush=True)
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
             return
-        up_writer.write(head)
-        await up_writer.drain()
+        if not await self.send_upstream(
+            reader, writer, up_reader, up_writer, head, auth
+        ):
+            return
         await self.pipe(reader, writer, up_reader, up_writer)
+
+    async def authenticate(self, up_reader, up_writer, auth) -> bytes:
+        """Log in to an upstream proxy that answered 407.
+
+        Returns the buffered bytes of the upstream's reply, if it sent more
+        than the status line. Raises OSError when the login fails.
+        """
+        token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+        up_writer.write(
+            b"Proxy-Authorization: Basic " + token.encode() + b"\r\n"
+        )
+        await up_writer.drain()
+        try:
+            rsp = await asyncio.wait_for(
+                up_reader.readuntil(b"\r\n\r\n"), timeout=15
+            )
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
+            raise OSError(f"upstream proxy closed during login: {exc}") from exc
+        except asyncio.TimeoutError as exc:
+            raise OSError("upstream proxy login timed out") from exc
+
+        status = rsp.split(b"\r\n", 1)[0].decode("latin-1")
+        parts = status.split()
+        code = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        if not 200 <= code < 400:
+            raise OSError(f"upstream proxy login failed: {status}")
+        print(f"UPSTREAM-AUTH ok ({auth[0]})", flush=True)
+        return rsp.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in rsp else b""
+
+    async def send_upstream(
+        self, reader, writer, up_reader, up_writer, head: bytes, auth
+    ) -> bool:
+        """Send the request line to an upstream proxy, adding credentials.
+
+        The caller writes the buffered ClientHello or request headers after
+        this returns True. Returns False when the upstream rejected the login.
+        """
+        line, sep, rest = head.partition(b"\r\n")
+        is_connect = line.startswith(b"CONNECT ")
+        if auth is None:
+            up_writer.write(line + sep)
+            await up_writer.drain()
+            if not is_connect:
+                up_writer.write(rest)
+                await up_writer.drain()
+            return True
+
+        up_writer.write(line + b"\r\n")
+        await up_writer.drain()
+        try:
+            rsp = await asyncio.wait_for(
+                up_reader.readuntil(b"\r\n\r\n"), timeout=15
+            )
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            rsp = b""
+        except asyncio.TimeoutError:
+            rsp = b""
+
+        status = rsp.split(b"\r\n", 1)[0].decode("latin-1") if rsp else ""
+        fields = status.split()
+        code = int(fields[1]) if len(fields) > 1 and fields[1].isdigit() else 0
+
+        if rsp and code != 407:
+            # No credentials needed: pass the answer through.
+            up_writer.write(rest)
+            await up_writer.drain()
+            writer.write(rsp)
+            await writer.drain()
+            return True
+
+        try:
+            buffered = await self.authenticate(up_reader, up_writer, auth)
+        except OSError as exc:
+            print(f"UPSTREAM-AUTH failed: {exc}", flush=True)
+            writer.write(
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            return False
+
+        up_writer.write(line + b"\r\n" + rest)
+        await up_writer.drain()
+        if is_connect:
+            writer.write(
+                b"HTTP/1.1 200 Connection Established\r\n\r\n"
+            )
+            await writer.drain()
+        if buffered:
+            writer.write(buffered)
+            await writer.drain()
+        return True
 
     async def pipe(self, reader, writer, up_reader, up_writer) -> None:
         async def copy(src, dst):
@@ -369,12 +564,49 @@ def install_sighup(guard: Guard) -> None:
 
 async def main(args) -> None:
     guard = Guard(args.allowlist, args.mode, args.default, args.apps_dir)
-    server = await asyncio.start_server(guard.handle, args.listen_host, args.listen_port)
+    upstream = None
+    if args.upstream:
+        up_host, _, port_text = args.upstream.rpartition(":")
+        upstream = (up_host or args.upstream, int(port_text or 8080))
+        if not args.upstream_user:
+            print("WARN --upstream set without --upstream-user", flush=True)
+    upstream_auth = None
+    if args.upstream_user:
+        upstream_auth = (args.upstream_user, args.upstream_password)
+        if upstream is None:
+            print("WARN --upstream-user set without --upstream", flush=True)
+    server = await asyncio.start_server(
+        lambda reader, writer: guard.handle(
+            reader, writer, auth=upstream_auth, upstream=upstream
+        ),
+        args.listen_host,
+        args.listen_port,
+    )
+    extra_ports = []
+
+    for port, app in load_app_ports(args.app_ports_file):
+        try:
+            extra = await asyncio.start_server(
+                lambda reader, writer, app=app: guard.handle(
+                    reader,
+                    writer,
+                    app_hint=app,
+                    auth=upstream_auth,
+                    upstream=upstream,
+                ),
+                args.listen_host,
+                port,
+            )
+        except OSError as exc:
+            print(f"WARN app port {port} for {app} failed: {exc}", flush=True)
+            continue
+        extra_ports.append((port, app))
     install_sighup(guard)
     print(
         f"strict proxy on {args.listen_host}:{args.listen_port} "
         f"mode={args.mode} default={args.default} "
-        f"allowlisted={len(guard.allowed)} apps={guard.apps_dir} logged",
+        f"allowlisted={len(guard.allowed)} apps={guard.apps_dir} "
+        f"app_ports={extra_ports} logged",
         flush=True,
     )
     async with server:
@@ -394,11 +626,34 @@ if __name__ == "__main__":
         "/etc/doorman/apps)",
     )
     parser.add_argument(
+        "--app-ports-file",
+        type=Path,
+        default=DEFAULT_APP_PORTS,
+        help="port-to-app mappings for clients that cannot send proxy "
+        "credentials (default: /etc/doorman/apps/ports.conf)",
+    )
+    parser.add_argument(
         "--default",
         choices=("deny", "allow"),
         default="deny",
         help="policy for hosts not on the allowlist: deny (allowlist-only) "
         "or allow (allow everything) (default: deny)",
+    )
+    parser.add_argument(
+        "--upstream",
+        default="",
+        help="forward allowed traffic through HOST:PORT instead of connecting "
+        "directly (for a host where direct traffic is blocked)",
+    )
+    parser.add_argument(
+        "--upstream-user",
+        default="",
+        help="username for an upstream proxy that answers 407",
+    )
+    parser.add_argument(
+        "--upstream-password",
+        default="",
+        help="password for the upstream proxy",
     )
     parser.add_argument(
         "--dry-run",

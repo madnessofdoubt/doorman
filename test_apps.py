@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from strict_proxy import Guard, parse_proxy_app, strip_proxy_headers
+from strict_proxy import Guard, load_app_ports, parse_proxy_app, strip_proxy_headers
 
 
 def basic(user: str, password: str = "doorman") -> bytes:
@@ -84,6 +84,24 @@ class StripHeadersTest(unittest.TestCase):
         self.assertIn(b"Host: x.test", stripped)
         self.assertIn(b"X-Test: y", stripped)
         self.assertIn(b"GET http://x.test/ HTTP/1.1", stripped)
+
+class AppPortsFileTest(unittest.TestCase):
+    def test_parses_valid_mappings_and_ignores_bad_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ports.conf"
+            path.write_text(
+                "# comment\n"
+                "8082 obsidian\n"
+                "18000 Steam\n"
+                "bad line\n"
+                "70000 nope\n"
+                "8082 other\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(load_app_ports(path), [(8082, "obsidian"), (18000, "steam")])
+
+    def test_missing_file_is_empty(self) -> None:
+        self.assertEqual(load_app_ports(Path("/nonexistent/doorman-ports")), [])
 
 
 if __name__ == "__main__":

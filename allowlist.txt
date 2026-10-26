@@ -12,3 +12,4 @@ chromewebstore.google.com
 cdn.jsdelivr.net # dashboard icons
 hcaptcha.com # captcha tiles
 youtube.com
+noctalia.dev

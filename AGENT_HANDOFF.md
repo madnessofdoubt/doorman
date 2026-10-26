@@ -1,8 +1,8 @@
 # doorman — agent handoff
 
 As of 2026-10-24. The browser-profile and per-app allowlist work is
-committed; see `git log` for the current commit. This document is for another
-agent picking up the project.
+committed; Git and Electron compatibility fixes are uncommitted. See Git
+state. This document is for another agent picking up the project.
 
 ## Purpose
 
@@ -92,7 +92,15 @@ every app, and this file adds hosts only for the app whose proxy username
 matches the file name. The file is ignored until it has at least one
 non-comment line. Restart the app after adding the first entries so it sends
 the proxy username. Apps that do not send proxy credentials use the global
-list only.
+list only, unless they are given a dedicated port below.
+
+### `/etc/doorman/apps/ports.conf`
+
+Optional `PORT APP` mappings for clients that can use a proxy but cannot send
+`Proxy-Authorization` (Electron apps such as Obsidian). The proxy reads this
+file at startup and treats every connection on that loopback port as the
+named app, without credentials. Restart `doorman-strict` after editing. The
+port is a label, not a secret; any same-UID process can use it.
 
 ### `/etc/doorman/allowlist.txt`
 
@@ -203,12 +211,17 @@ Verified on the host:
   proxy and is dropped by nftables. It is not selectively blocked by policy.
 - The strict proxy crash loop caused by `--default "$STRICT_DEFAULT"` was fixed
   by unquoting the unit heredoc.
-- 46 unit tests pass (including per-app auth, launcher, profile migration,
-  SNI fuzz, CONNECT parsing, and reload); `py_compile`, `bash -n`, and
-  `git diff --check` pass.
+- 49 unit tests pass (including per-app auth, app-port parsing, Git config,
+  launcher, profile migration, SNI fuzz, CONNECT parsing, and reload);
+  `py_compile`, `bash -n`, and `git diff --check` pass.
 - `doorman-run <app>` creates `/etc/doorman/apps/<app>.txt`; the proxy adds
   that file only for the matching proxy username. Live curl checks covered
   allow-for-app, deny-for-other-app, global fallback, and 407 on bad auth.
+- `doorman-run git` forces the authenticated proxy URL through Git's config;
+  a global plain `http.proxy` would otherwise override the environment.
+- App ports were verified live: the main port denied an obsidian-only host
+  while port 8082 allowed it, and Obsidian's update check logged
+  `ALLOW obsidian:releases.obsidian.md`.
 - The firewall validates a complete ruleset and swaps it in one nft
   transaction; a failed apply leaves the previous table in place.
 - Malformed CONNECT or TLS input is logged (`BAD CONNECT`, `ERROR`) instead of
@@ -220,8 +233,10 @@ Verified on the host:
 
 - **Per-app names are self-declared.** The proxy trusts the username in
   `Proxy-Authorization`; another process running as the daily user can claim
-  the same name. The app file is additive to the global list. Apps that ignore
-  proxy credentials stay on the global list. Real isolation needs cgroups.
+  the same name or use another app's port. The app file is additive to the
+  global list. Clients that cannot send proxy credentials can use a dedicated
+  port from `apps/ports.conf`. Either label is advisory; real isolation needs
+  cgroups.
 - **Loopback bypass.** An app can point itself at `:8080` and use the browser
   proxy, bypassing the strict allowlist for non-media traffic, or forge a
   `Referer` from an allowlisted site. Closing this needs per-process/cgroup
@@ -345,6 +360,11 @@ Strict proxy log lines:
 - `doorman-run` creates the per-app file and exports proxy env; the proxy does
   the filtering. Add hosts to `/etc/doorman/apps/<app>.txt`, then restart the
   app after the first entry so it sends the proxy username.
+- Git has its own `http.proxy`; `doorman-run git` overrides it for that run.
+- For Electron apps that cannot send proxy auth, add `PORT APP` to
+  `/etc/doorman/apps/ports.conf`, restart `doorman-strict`, and launch the app
+  with `--proxy-server=http://127.0.0.1:PORT`. Add all of its hosts to the app
+  file; ports are only labels.
 - The strict proxy logs to journald, not `/var/log/doorman`.
 - `git push` needs network. With enforcement on, direct HTTPS is dropped;
   temporarily stop `doorman-firewall` or push through the strict proxy.
@@ -353,8 +373,9 @@ Strict proxy log lines:
 
 - Policy is enforced per UID, not per binary.
 - The strict proxy decides by hostname; it does not decrypt TLS. Per-app
-  allowlists are selected by a self-declared proxy username and are additive
-  to the global list; they are policy organisation, not isolation.
+  allowlists are selected by a self-declared proxy username or dedicated port
+  and are additive to the global list; they are policy organisation, not
+  isolation.
 - Root is exempt; `--remove-wheel` is the normal lockdown step.
 - The browser proxy MITMs; the app proxy does not.
 - Proxy environment variables are routing, not enforcement. A process can clear
@@ -363,17 +384,16 @@ Strict proxy log lines:
 
 ## Git state
 
-The per-app allowlist work is committed; see `git log` for the current
-commit. The working tree should be clean.
+`HEAD` is `9489086` ("Add per-app allowlists to the strict proxy"). The working
+tree contains uncommitted compatibility fixes:
 
-- `strict_proxy.py` reads an optional `Proxy-Authorization` username, loads
-  `apps/<app>.txt`, adds it to the global list for that app, strips proxy
-  headers before forwarding, and answers 407 on malformed credentials;
-- `scripts/doorman-run-app.sh` creates the per-app file and uses proxy
-  credentials only after the file has entries;
-- the installer creates `/etc/doorman/apps` and installs the new runner;
-- `test_apps.py` and `test_doorman_run.py` cover parsing, union, reload, file
-  creation, and fallback; README and this document updated.
+- `doorman-run git` exports Git config for the authenticated proxy URL, which
+  overrides a plain global `http.proxy`;
+- `strict_proxy.py` reads `apps/ports.conf` and starts extra listeners that
+  treat every connection as a named app, for clients that cannot send proxy
+  auth;
+- tests cover app-port parsing and the Git config; README and this document
+  updated with the Electron/Obsidian setup.
 
 Verify with `git status` before assuming. Do not commit or rewrite the user's
 changes without being asked.

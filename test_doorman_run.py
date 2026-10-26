@@ -9,6 +9,11 @@ from pathlib import Path
 SCRIPT = Path(__file__).parent / "scripts" / "doorman-run-app.sh"
 FAKE_APP = r"""#!/bin/sh
 printf 'PROXY:%s\n' "$http_proxy"
+printf 'GIT_CONFIG_COUNT:%s\n' "${GIT_CONFIG_COUNT:-}"
+printf 'GIT_CONFIG_KEY_0:%s\n' "${GIT_CONFIG_KEY_0:-}"
+printf 'GIT_CONFIG_VALUE_0:%s\n' "${GIT_CONFIG_VALUE_0:-}"
+printf 'GIT_CONFIG_KEY_1:%s\n' "${GIT_CONFIG_KEY_1:-}"
+printf 'GIT_CONFIG_VALUE_1:%s\n' "${GIT_CONFIG_VALUE_1:-}"
 for arg in "$@"; do printf 'ARG:%s\n' "$arg"; done
 """
 
@@ -19,7 +24,14 @@ def write_executable(path: Path, body: str) -> None:
 
 
 class DoormanRunTest(unittest.TestCase):
-    def run_app(self, apps_dir: Path, *, steam: bool = False, args=()):
+    def run_app(
+        self,
+        apps_dir: Path,
+        *,
+        steam: bool = False,
+        args=(),
+        app_name=None,
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -28,6 +40,8 @@ class DoormanRunTest(unittest.TestCase):
 
             env = os.environ.copy()
             env["DOORMAN_APPS_DIR"] = str(apps_dir)
+            if app_name:
+                env["DOORMAN_APP_NAME"] = app_name
             if steam:
                 env["DOORMAN_STEAM_CMD"] = str(fake)
                 argv = ["sh", str(SCRIPT), "steam", *args]
@@ -91,6 +105,22 @@ class DoormanRunTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("PROXY:http://127.0.0.1:8081", result.stdout)
             self.assertIn("is missing", result.stderr)
+
+    def test_git_gets_authenticated_proxy_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            apps_dir = Path(tmp) / "apps"
+            apps_dir.mkdir()
+            (apps_dir / "git.txt").write_text("github.test\n", encoding="utf-8")
+            result = self.run_app(apps_dir, app_name="git")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("GIT_CONFIG_COUNT:2", result.stdout)
+            self.assertIn("GIT_CONFIG_KEY_0:http.proxy", result.stdout)
+            self.assertIn(
+                "GIT_CONFIG_VALUE_0:http://git:doorman@127.0.0.1:8081",
+                result.stdout,
+            )
+            self.assertIn("GIT_CONFIG_KEY_1:http.proxyAuthMethod", result.stdout)
+            self.assertIn("GIT_CONFIG_VALUE_1:basic", result.stdout)
 
 
 if __name__ == "__main__":

@@ -80,6 +80,16 @@ elif [ "$created" = 1 ]; then
     echo "doorman-run: add hosts to $file, then restart the app." >&2
 fi
 
+# Git's own http.proxy setting takes precedence over the environment. Force
+# the authenticated URL for this invocation when the app file has entries.
+if [ "$name" = "git" ] && [ "$use_app" = 1 ]; then
+    export GIT_CONFIG_COUNT=2
+    export GIT_CONFIG_KEY_0=http.proxy
+    export GIT_CONFIG_VALUE_0="$proxy_url"
+    export GIT_CONFIG_KEY_1=http.proxyAuthMethod
+    export GIT_CONFIG_VALUE_1=basic
+fi
+
 export http_proxy="$proxy_url"
 export https_proxy="$http_proxy"
 export HTTP_PROXY="$http_proxy"

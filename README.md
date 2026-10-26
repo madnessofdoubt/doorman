@@ -132,6 +132,30 @@ label, not a security boundary: another program running as you can use the
 same name. Apps that do not send proxy credentials fall back to the global
 list, so their per-app entries are ignored.
 
+For Git, `doorman-run git` sets `http.proxy` for that invocation, overriding a
+plain global `http.proxy`. Add the hosts Git needs to `git.txt`.
+
+Some clients cannot send the proxy username at all. Electron apps such as
+Obsidian reject credentials in `--proxy-server` and ignore `http_proxy`. Give
+them a dedicated loopback port:
+
+```conf
+# /etc/doorman/apps/ports.conf — one "PORT APP" per line
+8082 obsidian
+```
+
+```bash
+sudo systemctl restart doorman-strict
+printf -- '--proxy-server=http://127.0.0.1:8082\n' \
+  > ~/.config/obsidian/user-flags.conf
+```
+
+Restart Obsidian. Every connection on 8082 is treated as `obsidian`, so
+`obsidian.txt` applies without proxy auth. Add every host the app needs,
+including `github.com` and the release-asset hosts, to `obsidian.txt`. The
+proxy reads `ports.conf` at startup, so restart the strict service after
+changing it. The port is a label, not a secret.
+
 Development/manual:
 
 ```bash
@@ -213,9 +237,10 @@ existing firewall untouched.
 
 - Apps that ignore proxy settings bypass `strict_proxy.py` until the firewall
   is applied; with `--enforce`, they are dropped instead.
-- Per-app allowlists are additive and advisory. Any process running as the
-  daily user can present another app's name, and apps that ignore proxy
-  credentials fall back to the global list. Real isolation needs cgroups.
+- Per-app allowlists are additive and advisory. Proxy-aware clients use
+  `Proxy-Authorization`; clients that cannot send it can use a dedicated port
+  from `ports.conf`. Any process running as the daily user can use either
+  label. Real isolation needs cgroups.
 - The installer has one strict proxy for all non-browser apps.
 - The daily UID can reach both loopback proxies, so a non-browser app can use
   the browser proxy (`:8080`) and bypass the strict allowlist for non-media
